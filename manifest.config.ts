@@ -1,0 +1,35 @@
+import { defineManifest } from '@crxjs/vite-plugin';
+
+const icons = {
+  '16': 'icons/icon16.png',
+  '48': 'icons/icon48.png',
+  '128': 'icons/icon128.png',
+};
+
+const APP_HOSTS = ['https://your-app.example.com/*'];
+
+export default defineManifest({
+  manifest_version: 3,
+  name: 'WA Passkey Connector',
+  version: '0.1.0',
+  description:
+    'Imports an authenticated WhatsApp Web session into your app to pair a passkey-locked account.',
+  icons,
+  action: { default_popup: 'index.html', default_icon: icons },
+  background: { service_worker: 'src/background/index.ts', type: 'module' },
+  permissions: ['scripting', 'tabs', 'activeTab', 'storage', 'browsingData'],
+  host_permissions: ['https://web.whatsapp.com/*', ...APP_HOSTS],
+  content_scripts: [
+    {
+      matches: ['https://web.whatsapp.com/*'],
+      js: ['src/content/wa-web-dump.js'],
+      world: 'MAIN',
+      run_at: 'document_idle',
+    },
+    {
+      matches: APP_HOSTS,
+      js: ['src/content/app-bridge.ts'],
+      run_at: 'document_start',
+    },
+  ],
+});
