@@ -81,6 +81,20 @@ owner's explicit consent, and prefer private/unlisted or enterprise distribution
 over a public store listing. Session dumps are impersonation-grade - handle them
 as secrets end to end.
 
+## Acknowledgements
+
+This project stands on the shoulders of two open-source tools:
+
+- **[wa-web-dump](https://github.com/w3nder/wa-web-dump)** by
+  [Wender Teixeira (w3nder)](https://github.com/w3nder) - the in-page WhatsApp
+  Web session dumper this extension's `src/content/wa-web-dump.js` is based on.
+- **[wa-store-migrate](https://www.npmjs.com/package/wa-store-migrate)** by
+  [vini (vinikjkkj)](https://github.com/vinikjkkj) - the converter that turns a
+  WhatsApp Web dump into a whatsmeow snapshot, used on the backend side of the
+  end-to-end flow.
+
+Thank you to both - their work is the foundation this connector is built on.
+
 ## License
 
 Released into the **public domain** under [The Unlicense](LICENSE). Do anything
