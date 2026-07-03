@@ -148,12 +148,7 @@ export function bridgeInPage() {
   const announce = () =>
     window.postMessage({ source: SOURCE, type: 'CONNECTOR_READY' }, '*');
 
-  const fromWorker = [
-    'EXISTING_SESSION',
-    'IMPORT_SENT',
-    'IMPORT_ERROR',
-    'REGISTER_INSTANCE_RESULT',
-  ];
+  const fromWorker = ['PASSKEY_ASSERTION_RESULT', 'REGISTER_INSTANCE_RESULT'];
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && typeof msg.type === 'string' && fromWorker.includes(msg.type)) {
@@ -167,11 +162,11 @@ export function bridgeInPage() {
       | {
           target?: string;
           type?: string;
-          url?: string;
+          requestId?: string;
+          publicKey?: unknown;
           frontendOrigin?: string;
           apiOrigin?: string;
           apiUrl?: string;
-          forcePasskey?: boolean;
         }
       | undefined;
     if (!data || data.target !== SOURCE) return;
@@ -198,18 +193,12 @@ export function bridgeInPage() {
         });
     }
 
-    if (data.type === 'START_PASSKEY_IMPORT' && typeof data.url === 'string') {
+    if (data.type === 'RUN_PASSKEY_ASSERTION' && data.publicKey) {
       void chrome.runtime.sendMessage({
-        type: 'START_PASSKEY_IMPORT',
-        url: data.url,
-        frontendOrigin: data.frontendOrigin ?? window.location.origin,
-        apiOrigin: data.apiOrigin,
-        forcePasskey: data.forcePasskey === true,
+        type: 'RUN_PASSKEY_ASSERTION',
+        requestId: data.requestId,
+        publicKey: data.publicKey,
       });
-    }
-
-    if (data.type === 'CLEAR_AND_CONTINUE' || data.type === 'CANCEL_IMPORT') {
-      void chrome.runtime.sendMessage({ type: data.type });
     }
   });
 

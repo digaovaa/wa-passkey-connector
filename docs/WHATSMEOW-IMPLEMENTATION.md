@@ -1,14 +1,23 @@
-# Pairing a passkey-locked WhatsApp account via session import
+# Pairing a passkey-locked WhatsApp account with whatsmeow
 
-A complete, framework-agnostic guide to pairing a **passkey-locked** WhatsApp
-account with a [whatsmeow](https://github.com/tulir/whatsmeow) client, using a
-browser extension to import the owner's already-authenticated WhatsApp Web
-session.
+A complete, framework-agnostic guide to linking a companion device on a
+**passkey-locked** WhatsApp account with a
+[whatsmeow](https://github.com/tulir/whatsmeow) client, by **delegating the
+WebAuthn assertion** to the account owner's own browser - no session dump, no
+impersonation-grade copy.
 
 This document is generic: it describes the moving parts and the contracts
 between them so you can implement it in **your** stack (any backend, any
 frontend framework, your own whatsmeow worker). The companion browser extension
-in this repository is the one reusable, ready-made piece.
+in this repository is the one reusable, ready-made piece: it runs
+`navigator.credentials.get` on `web.whatsapp.com` and hands the assertion back.
+
+> **Two ways to solve this exist.** An older approach *dumps* the owner's
+> already-authenticated WhatsApp Web session and imports it into the whatsmeow
+> store. This guide documents the **cleaner** approach: let whatsmeow drive the
+> real pairing handshake and only delegate the one thing it cannot do headless -
+> the passkey signature. The result is a **freshly linked device with its own
+> credentials**, not a copy of the owner's session.
 
 ---
 
@@ -27,396 +36,390 @@ Practical consequences for a companion library (whatsmeow, Baileys, ...):
   the owner's device; hybrid/caBLE needs Bluetooth proximity to the owner's
   phone. None of this is available to a remote, credential-less caller.
 - The server **verifies** the assertion against the account's registered public
-  key with a fresh challenge. A forged assertion is silently rejected.
+  key with a fresh, single-use challenge. A forged assertion is silently
+  rejected.
 - Switching the companion platform or client version does not help: the gate is
   enforced **server-side, per account**.
 
-So you **cannot** pair a passkey-locked account by driving QR from a headless
-whatsmeow client. The only thing that can satisfy the server is the **real
-owner**, on **their** device/browser, using **their** passkey.
+So the assertion must be produced by the **real owner**, on **their** device /
+browser, with **their** passkey. Everything else in the linking handshake can be
+driven by your whatsmeow client.
 
-## 2. The solution
+## 2. The solution: delegate only the assertion
 
-The owner authenticates `web.whatsapp.com` in **their** browser with **their**
-real passkey (the native WhatsApp Web flow). That produces a fully registered
-**companion session** inside the browser. A browser extension then:
+whatsmeow **is** the device being linked. It performs the entire companion
+pairing handshake itself - it just cannot sign the WebAuthn challenge. So:
 
-1. Extracts ("dumps") that authenticated session from WhatsApp Web's local
-   storage.
-2. Your backend converts it to the whatsmeow store format.
-3. Your whatsmeow worker imports it and **reconnects** as that companion - no
-   re-pairing needed, because the companion is already registered on the server.
+1. Your whatsmeow client connects (unpaired) and **fetches the passkey
+   challenge** the server issued for this account.
+2. Your app relays that challenge to a page open in the **owner's** browser.
+3. The browser extension runs `navigator.credentials.get(challenge)` on the
+   `web.whatsapp.com` origin. The owner confirms with their passkey (Windows
+   Hello, phone, security key, ...) and the 2FA PIN if the account has two-step
+   verification. This yields a **WebAuthn assertion**.
+4. The assertion travels back to your whatsmeow client, which submits it to the
+   server (`SendPasskeyResponse`) and confirms the handoff
+   (`SendPasskeyConfirmation`).
+5. The server links the device. whatsmeow emits `PairSuccess`, then `Connected`.
 
-The credential material (noise key, identity key, the server-signed device
-identity) is portable: reconnecting only requires presenting it over the Noise
-handshake. This is **using** the real passkey session, not bypassing anything.
+The linked device is **new** - it has its own registration id, noise key and
+identity key, minted by the normal companion pairing. Nothing of the owner's
+existing session is read or moved. This is **using** the passkey exactly as
+designed, for a single challenge, with the owner present.
 
-> **Move, don't duplicate.** WhatsApp does not run the same companion device in
-> two places. After extracting the session you must **clear** the browser's
-> WhatsApp Web storage, otherwise a reopened tab brings up a second live socket
-> on the same credentials and the server issues `stream_error_replaced`, killing
-> one side (and, with auto-reconnect, they ping-pong).
+> **No "move, don't duplicate" problem.** Because this is a fresh companion (not
+> a copy of the owner's web session), there is no second live socket fighting
+> over the same credentials, and nothing to wipe.
 
 ## 3. Architecture
 
-Five components cooperate. Only #4 (the extension) is provided here; the rest you
+Four components cooperate. Only #3 (the extension) is provided here; the rest you
 implement in your own stack.
 
 | # | Component | Role |
 |---|-----------|------|
-| 1 | **whatsmeow worker** (yours) | Detects the passkey requirement; imports the session; connects. |
-| 2 | **backend / API** (yours) | Issues a signed one-time upload URL; receives the dump; stores it; triggers conversion + import. |
-| 3 | **converter** ([`wa-store-migrate`](https://www.npmjs.com/package/wa-store-migrate)) | Converts the WhatsApp Web dump into a whatsmeow snapshot. |
-| 4 | **browser extension** (this repo) | Drives `web.whatsapp.com`, forces passkey mode, dumps the paired session, uploads it. |
-| 5 | **frontend UI** (yours) | Detects the extension; guides the user; hands the signed URL to the extension. |
+| 1 | **whatsmeow worker** (yours) | Fetches the challenge; submits the assertion; confirms; connects. |
+| 2 | **backend / API** (yours) | Relays the challenge to the frontend and the assertion to the worker (both ephemeral). |
+| 3 | **browser extension** (this repo) | Runs `navigator.credentials.get` on `web.whatsapp.com`, returns the assertion. |
+| 4 | **frontend UI** (yours) | Detects the extension; fetches the challenge; drives the extension; shows progress. |
 
 ```mermaid
 sequenceDiagram
   participant WM as whatsmeow worker
+  participant BE as your backend
   participant UI as your frontend
   participant EXT as extension (SW)
   participant WA as web.whatsapp.com tab
-  participant BE as your backend
-  participant CV as converter (wa-store-migrate)
+  participant SRV as WhatsApp server
 
-  WM->>WM: GetQRChannel -> QRChannelEventPasskeyRequest
-  WM-->>UI: status = PASSKEY_REQUIRED (via your event bus)
-  UI->>UI: detect extension (postMessage PING / CONNECTOR_READY)
-  UI->>BE: POST /import-url  (generate signed one-time URL)
-  BE-->>UI: { url }
-  UI->>EXT: postMessage START_PASSKEY_IMPORT { url }
-  EXT->>WA: open tab (background), force passkey mode
-  Note over WA: owner authenticates with their passkey (+2FA PIN)
-  EXT->>WA: poll until session is COMPLETE + STABLE
-  EXT->>WA: window.__waWebSessionDump()
-  EXT->>BE: POST {url}  (the raw dump)
-  EXT->>WA: wipe storage + close tab (move, don't duplicate)
-  BE->>CV: convert wa-web dump -> whatsmeow snapshot
-  BE->>WM: import snapshot + connect
+  UI->>BE: user starts passkey pairing
+  BE->>WM: request the passkey challenge
+  WM->>SRV: GetPasskeyRequestOptions
+  SRV-->>WM: WebAuthnPublicKey (challenge)
+  WM-->>BE: challenge (event / webhook)
+  BE-->>UI: { publicKey } (challenge)
+  UI->>EXT: postMessage RUN_PASSKEY_ASSERTION { publicKey }
+  EXT->>WA: open tab, navigator.credentials.get(challenge)
+  Note over WA: owner confirms with their passkey (+2FA PIN)
+  WA-->>EXT: assertion (WebAuthnResponse)
+  EXT-->>UI: postMessage PASSKEY_ASSERTION_RESULT { assertion }
+  UI->>BE: POST assertion
+  BE->>WM: submit assertion
+  WM->>SRV: SendPasskeyResponse(assertion)
+  SRV-->>WM: PairPasskeyConfirmation { code, skipHandoffUX }
+  WM->>SRV: SendPasskeyConfirmation
+  Note over SRV: owner approves the new device on their phone (if not skipped)
+  SRV-->>WM: PairSuccess -> Connected
   WM-->>UI: status = CONNECTED
-  UI->>UI: close the modal
 ```
 
-## 4. whatsmeow: detecting the passkey requirement
+## 4. whatsmeow: the passkey pairing loop
 
-The passkey requirement is **not** delivered through `AddEventHandler`. It
-arrives on the **QR channel** returned by `GetQRChannel`. For a passkey-locked
-account, instead of (or in addition to) `QRChannelEventCode`, the channel emits
-`QRChannelEventPasskeyRequest`, whose `item.PasskeyRequest` is an
-`*events.PairPasskeyRequest` carrying the WebAuthn challenge.
+You need a whatsmeow build with **passkey pairing support** - specifically the
+methods `SendPasskeyResponse`, `SendPasskeyConfirmation` and the internal
+`GetPasskeyRequestOptions`, plus the `types.WebAuthnPublicKey` /
+`types.WebAuthnResponse` types and the `events.PairPasskey*` events (all in
+`pair-passkey.go`). This landed **upstream** in
+[`tulir/whatsmeow#1186`](https://github.com/tulir/whatsmeow/pull/1186) ("pair:
+add support for passkeys", merged 2026-07), so a current `go.mau.fi/whatsmeow`
+release has everything you need - **no fork required**. Just make sure your
+pinned version is at or after that merge.
 
-> `QRChannelEventPasskeyRequest` exists in whatsmeow builds that carry passkey
-> support (see the upstream work in `tulir/whatsmeow#1186`). If your pinned
-> whatsmeow does not expose it, you need a build that does.
+> Other companion libraries (e.g. [Baileys](https://github.com/WhiskeySockets/Baileys))
+> do not expose passkey pairing yet, so the response direction of this flow is
+> whatsmeow-only for now. The browser extension itself is library-agnostic - it
+> only produces a WebAuthn assertion.
+
+The passkey pairing has a **request** direction (get the challenge) and a
+**response** direction (submit the assertion + confirm). The extension only sits
+between them.
+
+### 4.1 Fetch the challenge
+
+On connect, the server sends a **QR code by default**; the passkey notification
+does **not** reliably auto-fire. Fetch the challenge explicitly once the client
+is connected (unpaired):
 
 ```go
-qrChan, err := client.GetQRChannel(ctx)
-if err != nil { /* handle */ }
-go client.Connect()
+// client is connected and unpaired.
+pk, err := client.DangerousInternals().GetPasskeyRequestOptions(ctx)
+if err != nil {
+    // No passkey for this account (or not passkey-locked) -> stay on QR.
+    return
+}
+// pk is *types.WebAuthnPublicKey: { Challenge, Timeout, RelyingPartID,
+// AllowCredentials[], UserVerification, Extensions }. Its binary fields are
+// jsonbytes.UnpaddedURLBytes (base64url). Marshal it to JSON and relay it to
+// your frontend as-is.
+challengeJSON, _ := json.Marshal(pk)
+publishPasskeyChallenge(challengeJSON) // -> your event bus / webhook -> frontend
+```
 
-passkeyRequired := false
+If your build delivers the challenge via the QR channel instead, handle it
+there - `item.PasskeyRequest.PublicKey` on `QRChannelEventPasskeyRequest` is the
+same `*types.WebAuthnPublicKey`:
+
+```go
+qrChan, _ := client.GetQRChannel(ctx)
+go client.Connect()
 for item := range qrChan {
     switch item.Event {
     case whatsmeow.QRChannelEventCode:
-        // IMPORTANT: once passkey is required, stop emitting QR. The channel
-        // keeps producing QR codes for a passkey-locked account even though QR
-        // pairing can never complete; emitting them confuses your UI.
-        if passkeyRequired {
-            continue
-        }
-        publishQR(item.Code, item.Timeout)
-
+        publishQR(item.Code, item.Timeout) // normal accounts
     case whatsmeow.QRChannelEventPasskeyRequest:
-        passkeyRequired = true
-        // Signal your app: this connection needs the extension flow.
-        // req := item.PasskeyRequest  // *events.PairPasskeyRequest (challenge)
-        publishPasskeyRequired()
-
-    case whatsmeow.QRChannelEventSuccess:
-        // Normal (non-passkey) accounts finish here. Passkey accounts do not.
-
-    case whatsmeow.QRChannelEventTimeout, whatsmeow.QRChannelEventError:
-        // channel ended
+        publishPasskeyChallenge(item.PasskeyRequest.PublicKey)
     }
 }
 ```
 
-Surface `publishPasskeyRequired()` to your frontend however you already push
-connection status (websocket, SSE, polling, webhook). The frontend uses it to
-switch from "show QR" to "resolve passkey via the extension".
+The challenge is **single-use** with a short TTL (~10 min). Mint it when the
+user is actually ready to sign (i.e. on their click), not speculatively on every
+connect. A retry needs a fresh challenge (a new connect / a new
+`GetPasskeyRequestOptions`).
+
+### 4.2 Submit the assertion
+
+When the assertion comes back from the browser (section 5), unmarshal it into
+`types.WebAuthnResponse` and submit it:
+
+```go
+var resp types.WebAuthnResponse
+if err := json.Unmarshal(assertionJSON, &resp); err != nil { /* 400 */ }
+
+if err := client.SendPasskeyResponse(ctx, &resp); err != nil {
+    // server rejected the assertion (stale challenge, wrong account, ...)
+}
+```
+
+`types.WebAuthnResponse` maps 1:1 to what the browser's `navigator.credentials.
+get(...).toJSON()` produces:
+
+```go
+type WebAuthnResponse struct {
+    ID       string                     `json:"id"`
+    RawID    jsonbytes.UnpaddedURLBytes `json:"rawId"`
+    Type     string                     `json:"type"`
+    Response WebAuthnResponseData       `json:"response"`
+}
+type WebAuthnResponseData struct {
+    ClientDataJSON    jsonbytes.UnpaddedURLBytes  `json:"clientDataJSON"`
+    AuthenticatorData jsonbytes.UnpaddedURLBytes  `json:"authenticatorData"`
+    Signature         jsonbytes.UnpaddedURLBytes  `json:"signature"`
+    UserHandle        *jsonbytes.UnpaddedURLBytes `json:"userHandle"`
+}
+```
+
+### 4.3 Confirm the handoff
+
+After `SendPasskeyResponse`, the server's continuation is **auto-routed** on the
+same socket (you wire nothing). It surfaces as `events.PairPasskeyConfirmation`:
+
+```go
+client.AddEventHandler(func(evt any) {
+    switch e := evt.(type) {
+    case *events.PairPasskeyConfirmation:
+        // e.Code          - a short code shown to the user (informational)
+        // e.SkipHandoffUX - whether the phone handoff is skipped
+        if !e.SkipHandoffUX {
+            // The owner will approve the new device on their phone. Call confirm;
+            // the pairing completes once they tap approve.
+            _ = client.SendPasskeyConfirmation(ctx)
+        }
+        // When SkipHandoffUX is true, whatsmeow's QR-channel loop auto-confirms
+        // for you - do nothing.
+    case *events.PairSuccess:
+        // device linked. Connected follows.
+    case *events.PairPasskeyError:
+        // e.Error, e.Continuation
+    }
+})
+```
+
+Two behaviours to know:
+
+- On the QR channel, whatsmeow **auto-calls `SendPasskeyConfirmation`** when
+  `SkipHandoffUX == true`, and only surfaces the confirmation item (so you must
+  confirm) when `SkipHandoffUX == false`. If you drive it from the event handler
+  as above, call confirm only in the `!SkipHandoffUX` branch to avoid confirming
+  twice.
+- With `SkipHandoffUX == false`, WhatsApp shows the owner a **security handoff**
+  on their phone; the device links when they approve it. The `Code` is
+  informational ("check your phone").
+
+That is the whole worker side: fetch challenge -> submit assertion -> confirm ->
+`PairSuccess` -> `Connected`. No store surgery, no re-pairing.
 
 ## 5. The browser extension (this repo)
 
-The extension is the only piece that must touch `web.whatsapp.com`. It has three
+The extension is the only piece that touches `web.whatsapp.com`. It has two
 scripts:
 
-- **`src/content/wa-web-dump.js`** (injected into `web.whatsapp.com`, MAIN
-  world). Exposes `window.__waWebSessionDump()` on demand. It walks WhatsApp
-  Web's IndexedDB / localStorage and returns the session as JSON.
-- **`src/content/app-bridge.ts`** (injected into **your** app pages). The
+- **`src/content/app-bridge.ts`** (injected into **your** app pages). A small
   detection + message relay bridge between your page and the service worker.
-- **`src/background/index.ts`** (MV3 service worker). Orchestration.
+- **`src/background/index.ts`** (MV3 service worker). On
+  `RUN_PASSKEY_ASSERTION { publicKey }` it opens `web.whatsapp.com`, runs
+  `navigator.credentials.get` in the page's MAIN world with your challenge, and
+  returns the assertion (`PASSKEY_ASSERTION_RESULT { assertion }`).
 
 ### 5.1 What the service worker does
 
-1. Receives `START_PASSKEY_IMPORT { url }` from your page (via the bridge).
-2. Opens `web.whatsapp.com` in a **background** tab (so detection happens before
-   focus is stolen).
-3. **Detects a pre-existing session** (reads `last-wid-md`). If another account
-   is already logged in on this browser, it asks your page for consent
-   (`EXISTING_SESSION`) and, on `CLEAR_AND_CONTINUE`, wipes the WhatsApp Web
-   storage before proceeding.
-4. **Forces passkey mode** in the tab (see 5.2), then focuses it so the owner can
-   complete WhatsApp's native passkey flow (choose passkey, and enter the 2FA PIN
-   if the account has two-step verification).
-5. **Waits for a complete + stable session** (see 5.3), calls
-   `window.__waWebSessionDump()`, and `POST`s the dump to the signed `url`.
-6. **Wipes** the WhatsApp Web storage (move, don't duplicate) and closes the tab.
+1. Receives `RUN_PASSKEY_ASSERTION { requestId, publicKey }` from your page.
+2. Opens `web.whatsapp.com` in a **focused** tab (so the OS passkey prompt has
+   focus) and waits for it to load.
+3. Injects `runPasskeyAssertionInPage(publicKey)` into the page's **MAIN world**
+   and awaits its result. That function is the standard WebAuthn call:
 
-### 5.2 Forcing passkey mode
+   ```js
+   const credential = await navigator.credentials.get({
+     publicKey: {
+       challenge: base64UrlToBuffer(publicKey.challenge),
+       rpId: publicKey.rpId,                     // "whatsapp.com"
+       allowCredentials: (publicKey.allowCredentials || []).map((c) => ({
+         id: base64UrlToBuffer(c.id), type: 'public-key', transports: c.transports,
+       })),
+       userVerification: publicKey.userVerification,
+       timeout: publicKey.timeout,
+     },
+   });
+   return credential.toJSON(); // -> { id, rawId, type, response{...} }, base64url
+   ```
 
-Injected into the page's MAIN world:
+4. Returns `PASSKEY_ASSERTION_RESULT { requestId, assertion }` (or
+   `{ requestId, error }`) to your page, then closes the tab.
 
-```js
-window.requireLazy(
-  ['WAWebLinkDeviceEvents', 'WAWebAltDeviceLinkingApi', 'WAWebPairingType'],
-  (Events, AltApi, PairingType) => {
-    AltApi.setPairingType(PairingType.PairingType.SHORTCAKE_PASSKEY);
-    Events.WAWebLinkDeviceEvents.triggerPasskeyPrologueRequest();
-  }
-);
-```
+The extension runs on the `web.whatsapp.com` **origin** so the assertion is
+scoped to `rpId = whatsapp.com` (web.whatsapp.com is in scope). A plain
+`web.whatsapp.com` tab is enough - no logged-in session, no special page state.
 
-This only **steers the WhatsApp Web client** toward the passkey step; the passkey
-prologue itself is server-driven and only fires for accounts in the passkey
-bucket. The extension deliberately does **not** call `navigator.credentials.get`
-itself - WhatsApp Web drives the real WebAuthn assertion (and the 2FA PIN) as a
-native, user-gestured flow. The injection self-retries until
-`window.requireLazy` is available, otherwise the QR would show.
+### 5.2 Encoding: keep the assertion verbatim
 
-### 5.3 Completion detection (avoids the 401)
+WebAuthn wire encoding here is **base64url, unpadded**. whatsmeow decodes these
+fields with Go's strict `RawURLEncoding`, which **rejects** `=` padding and the
+`+` / `/` of standard base64.
 
-A **premature** dump (taken mid-registration, or of a session superseded by a
-retry) produces credentials the server rejects with `logged_out_401` the instant
-the imported client connects (`connectedFor: 0`). To avoid it, only dump when the
-session is **complete and stable**:
+- `credential.toJSON()` (the preferred path) already emits unpadded base64url.
+- If you build the response manually, strip padding and use the URL alphabet:
+  `btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')`.
+- **Forward the assertion as strings, verbatim, through every layer** (frontend
+  -> backend -> worker). Never round-trip it through a `Buffer`/base64 re-encode
+  (that would re-pad it and break the server's verification), and never store or
+  transform it - it is small; pass it through.
 
-- `device.noiseKey`, `device.identityKey`, `device.account` and `device.meJid`
-  are all present, **and**
-- `device.meJid` is unchanged across two consecutive polls.
+The challenge's binary fields (`challenge`, `allowCredentials[].id`) are likewise
+base64url strings; `base64UrlToBuffer` decodes them to `ArrayBuffer` for the API.
+The server-provided challenge does not carry binary-input extensions
+(`prf`/`largeBlob`) in practice; pass `extensions` through as-is.
 
-The extension polls every 2.5s for up to ~5 minutes. If the account is paired but
-the noise key never materializes (a WhatsApp Web schema change broke the dumper),
-it fails fast with a distinct `noise_key_unavailable` reason instead of a generic
-timeout.
-
-### 5.4 Configuring the extension for your app
+### 5.3 Configuring the extension for your app
 
 Edit **`manifest.config.ts`**: set `APP_HOSTS` to the origin(s) where your web
 app runs (add `http://localhost/*` while developing). Keep the same list in
 `APP_HOST_PATTERNS` in `src/background/index.ts` (used to inject the bridge into
-already-open tabs on install).
-
-`host_permissions`, `browsingData` (to wipe the WhatsApp Web session), and the
-`scripting`/`tabs` permissions are required. `browsingData` is scoped to
-`web.whatsapp.com` only.
+already-open tabs on install). The only permissions needed are `scripting`,
+`tabs`, `activeTab`, `storage`, plus `host_permissions` for `web.whatsapp.com`
+and your app host(s). There is no `browsingData` and no code that reads the
+WhatsApp Web session.
 
 ## 6. Your frontend UI
 
-Your UI owns the connection-management screen. When a connection reports
-`PASSKEY_REQUIRED`, render a "resolve" panel instead of the QR. Everything is
-driven by `window.postMessage` against the extension bridge - the protocol is in
-[section 12](#12-the-postmessage-protocol).
+Your UI owns the connection-management screen. When a connection needs a passkey,
+render a "resolve" panel instead of the QR. Everything is driven by
+`window.postMessage` against the extension bridge - the protocol is in
+[section 10](#10-the-postmessage-protocol).
 
-Recommended states:
+Recommended flow:
 
 1. **Detect the extension** - `postMessage` a `PING`; if you receive
    `CONNECTOR_READY` within ~1.5s, it is installed. Ping a few times to cover the
    content-script attaching a beat late.
-2. **Not installed** - show install instructions (there is no store-hosted build;
-   users load the unpacked `dist/`, or you distribute a `.crx`).
-3. **Installed** - show a **Resolve authentication** button. On click: ask your
-   backend for a signed upload URL, then `postMessage`
-   `START_PASSKEY_IMPORT { url }`.
-4. **Existing session** - if you receive `EXISTING_SESSION { number }`, show a
-   consent prompt ("another account is logged in on this browser; log it out and
-   continue?"). On confirm, `postMessage` `CLEAR_AND_CONTINUE`; on cancel,
-   `CANCEL_IMPORT`.
-5. **In progress / done** - on `IMPORT_SENT` show "connecting..."; on
-   `IMPORT_ERROR { reason }` show the error and let the user retry. Close the
-   modal when your own connection status reaches `CONNECTED`.
+2. **Not installed** - link to your store listing or show load-unpacked
+   instructions for `dist/`.
+3. **Resolve** - on the user's click:
+   1. fetch the challenge from your backend (`{ publicKey }`);
+   2. `postMessage` `RUN_PASSKEY_ASSERTION { requestId, publicKey }`;
+   3. on `PASSKEY_ASSERTION_RESULT { assertion }`, `POST` the assertion to your
+      backend;
+   4. show "connecting..."; close the modal when your own connection status
+      reaches `CONNECTED`.
 
-Two robustness notes learned the hard way:
+Correlate the round trip with a `requestId` so overlapping runs never cross
+wires, and put a timeout on waiting for the result (the OS prompt can sit open
+for a while). Two robustness notes:
 
 - Make `PASSKEY_REQUIRED` **sticky** in the modal: once latched, ignore stray
   `qrcode`/disconnect status updates so the modal does not flip back to QR while
   the worker keeps cycling QR events. Release the latch only on `CONNECTED` or
   when the modal is reopened.
-- If you fetch the connection status on open, guard that async response against
-  the latch too, so a stale in-flight response can't overwrite the passkey UI.
+- The challenge is single-use with a short TTL. If your backend mints it on
+  demand and the round trip is slow, handle a "not ready yet / expired" answer
+  by re-fetching a fresh challenge.
 
 ## 7. Your backend
 
-Two endpoints and a storage step. The signed URL is a **one-time, short-lived**
-capability handed to the extension.
+The backend is a thin, **stateful-but-ephemeral** relay. It never stores the
+challenge or the assertion beyond the pairing.
 
-### 7.1 Generate the upload URL
-
-```
-POST /import-url            (authenticated as your app user)
-  -> verify the target connection is passkey-pending
-  -> sign a short-lived (e.g. 10 min) one-time token:
-       jwt.sign({ connectionId, purpose: 'wa-import', jti }, SECRET, { expiresIn })
-       + store the jti as a single-use nonce (e.g. Redis SET NX EX)
-  -> return { url: `${PUBLIC_BASE}/import/${token}` }
-```
-
-`PUBLIC_BASE` must be reachable **by the owner's browser** (the extension POSTs
-there), i.e. your public API origin, not an internal hostname.
-
-Fail **closed**: if the signing secret is unset, refuse to issue URLs.
-
-### 7.2 Receive the dump
+### 7.1 Get the challenge to the frontend
 
 ```
-POST /import/:token         (public; the token is the auth)
-  -> verify the token AND atomically consume the nonce (GETDEL); reused -> 410
-  -> read the raw JSON dump from the body (allow a large body, e.g. 25 MB)
-  -> (optional) sanity-check the sender against the target connection
-  -> store the dump (S3-compatible object storage) or hand it straight to the converter
-  -> trigger conversion + import (section 8, 9)
+GET /passkey-challenge/:connectionId     (authenticated as your app user)
+  -> if you already have a fresh challenge cached for this connection, return it
+  -> else ask your worker to fetch one (section 4.1); the worker emits it on your
+     event bus; stash it briefly (e.g. Redis, TTL ~= the challenge TTL) keyed by
+     connection, and return { publicKey } (poll or push via socket)
 ```
 
-### 7.3 Moving the dump between services
+Mint on demand (on the user's action), because the challenge is single-use.
 
-If your converter/worker are separate services, don't inline a multi-MB dump
-through your event bus. Store it (S3/MinIO), then pass a **presigned URL** that
-the next service fetches. Make sure that presigned URL's host is reachable by the
-consuming service (a common cross-service gotcha: presigning with an internal
-`minio:9000` host that another container can't resolve). Keep the presign TTL
-short.
+### 7.2 Relay the assertion to the worker
 
-## 8. Conversion: `wa-store-migrate`
-
-[`wa-store-migrate`](https://www.npmjs.com/package/wa-store-migrate) converts
-between WhatsApp session formats through a canonical intermediate representation.
-
-```ts
-import { snapshot, bufferJsonReviver } from 'wa-store-migrate';
-
-// rawDump = the JSON your extension posted (byte fields are { type: 'Buffer', data: '<base64>' })
-const ir = snapshot.from('wa-web', coerceBufferJson(rawDump));
-const whatsmeowSnapshot = snapshot.toJSON('whatsmeow', ir);
-// whatsmeowSnapshot: device identity + prekeys + identities + sessions + sender keys
-// (byte leaves as base64 strings) - feed this to your Go importer.
+```
+POST /passkey-response/:connectionId     (authenticated as your app user)
+  body = the WebAuthnResponse the extension returned
+  -> forward it verbatim to the worker (RPC / command bus) which calls
+     SendPasskeyResponse (section 4.2)
+  -> return 202; the pairing outcome arrives via your normal connection-status
+     channel (CONNECTED)
 ```
 
-## 9. Importing into the whatsmeow store (Go)
+Forward the assertion as a JSON object of strings. **Do not** decode/re-encode
+its base64url fields anywhere on the path (section 5.2).
 
-Populate a fresh device in your whatsmeow `sqlstore.Container` from the snapshot,
-then connect. This does **not** re-pair - the companion is already registered.
-
-Key details, each a gotcha in disguise:
-
-- **Delete any leftover device first** (from an aborted pairing attempt), then
-  `container.NewDevice()`.
-- Set `device.ID` (the `meJid`), `device.LID`, `RegistrationID`, `NoiseKey`,
-  `IdentityKey`, `SignedPreKey` (with its 64-byte signature), `Account` (the
-  `ADVSignedDeviceIdentity`), `Platform`, and `Initialized = true`.
-- **`advSecretKey`**: WhatsApp Web wipes it right after pairing. Substitute 32
-  zero bytes - it is only needed to *re-pair*, never to *reconnect*.
-- Import pre-keys, identities, sessions, sender keys, contacts, privacy tokens.
-  (If your `Container` does not expose its `*sql.DB`, open a second handle with
-  the same SQLite driver to insert pre-keys at explicit key IDs.)
-- **Skip app-state** (sync keys / versions). The server returns a full app-state
-  snapshot and whatsmeow re-requests the sync keys from the phone on first
-  connect, so it self-heals.
-- `client.Connect()` afterwards. A `stream:error 515` immediately after connect
-  is routine - reconnect (enable auto-reconnect).
-
-```go
-func populateDeviceIdentity(device *store.Device, d *WebDeviceSnapshot) error {
-    jid, err := types.ParseJID(d.MeJid)
-    if err != nil { return err }
-    device.ID = &jid
-    if d.MeLid != "" {
-        lid, err := types.ParseJID(d.MeLid)
-        if err != nil { return err }
-        device.LID = lid
-    }
-
-    device.RegistrationID = d.RegistrationID
-    device.NoiseKey = mustKeyPair(d.NoiseKey)
-    device.IdentityKey = mustKeyPair(d.IdentityKey)
-    device.SignedPreKey = &keys.PreKey{
-        KeyPair:   mustKeyPair(d.SignedPreKey.KeyPair),
-        KeyID:     d.SignedPreKey.KeyID,
-        Signature: mustSig64(d.SignedPreKey.Signature),
-    }
-
-    // wa-web wipes the ADV secret post-pairing; it is not needed to reconnect.
-    advSecret := decode(d.AdvSecretKey)
-    if len(advSecret) == 0 {
-        advSecret = make([]byte, 32)
-    }
-    device.AdvSecretKey = advSecret
-
-    device.Platform = d.Platform
-    device.Initialized = true
-    if d.Account != nil {
-        device.Account = &waAdv.ADVSignedDeviceIdentity{
-            Details:             decode(d.Account.Details),
-            AccountSignatureKey: decode(d.Account.AccountSignatureKey),
-            AccountSignature:    decode(d.Account.AccountSignature),
-            DeviceSignature:     decode(d.Account.DeviceSignature),
-        }
-    }
-    return nil
-}
-
-// then: container.PutDevice(ctx, device); reload via GetDevice; import prekeys/
-// identities/sessions/senderKeys/contacts; NewClient(device); client.Connect()
-```
-
-If the reconnect is immediately met with `logged_out_401` / `connectedFor: 0`,
-the dump was premature or superseded - see 5.3.
-
-## 10. Delivering the "passkey required" event reliably
+## 8. Delivering the "passkey" events reliably
 
 If your whatsmeow layer delivers events to your app through a **per-session
-subscription filter** (only some event types forwarded), make the
-"passkey required" event an **always-delivered control event**. Otherwise
-sessions created before you added the event to the filter (i.e. every existing
-session in production) will never receive it, and you would have to backfill each
-one. Treat pairing-lifecycle events as non-optional at the delivery layer.
+subscription filter** (only some event types forwarded), make the passkey
+lifecycle events (**challenge required** and **confirmation**)
+**always-delivered control events**. Otherwise sessions created before you added
+those events to the filter (i.e. every existing session in production) will never
+receive them, and you would have to backfill each one. Treat pairing-lifecycle
+events as non-optional at the delivery layer.
 
-## 11. Security, limits and gotchas
+## 9. Security, limits and gotchas
 
-- **No headless bypass.** The assertion needs the owner's authenticator. This
-  approach *uses* the real passkey session; it does not defeat the passkey.
-- **Premature dump -> 401.** Wait for a complete + stable session before
-  uploading (5.3).
-- **Move, don't duplicate.** Wipe the browser's WhatsApp Web storage after the
-  dump, or the reopened web tab and your worker fight over the same companion
-  (`stream_error_replaced`).
-- **Noise-key fragility.** The dumper can only read the noise key through a
-  WhatsApp Web internal module; a schema change upstream can break it. Surface a
-  distinct error and monitor.
-- **Runtime integrity checkpoint.** WhatsApp can push a separate anti-abuse
+- **No headless bypass.** The assertion needs the owner's authenticator, for a
+  single server-issued challenge, with the owner present. This *uses* the passkey
+  as designed; it does not defeat it.
+- **Fresh device, no impersonation copy.** Unlike a session dump, the linked
+  device has its own credentials. Nothing of the owner's existing session is read
+  or transported. The only sensitive value in flight is the one-shot WebAuthn
+  assertion.
+- **Single-use challenge.** Mint on the user's action; a retry needs a fresh one.
+- **Encoding is unforgiving.** base64url unpadded end to end; never re-pad or
+  standard-base64 the assertion (section 5.2).
+- **User gesture / focus.** Some authenticators want the tab focused / a user
+  gesture. Open the `web.whatsapp.com` tab focused (the extension does), and
+  drive the flow from the user's click.
+- **Runtime integrity checkpoint.** WhatsApp can later push an anti-abuse
   challenge (passkey or captcha) to an already-connected companion; a headless
-  client cannot answer a passkey checkpoint, and whatsmeow surfaces it as an
-  ordinary logout. Monitor for repeated logouts and re-run the import.
-- **The dump is impersonation-grade.** It contains the device's secret keys.
-  Encrypt it at rest, keep presign TTLs short, and capture only the fields your
-  importer actually uses (device identity, prekeys, identities, sessions, sender
-  keys, contacts, privacy tokens) - do not exfiltrate message secrets, device
-  lists or app-state you are going to discard.
-- **Terms of service / store policy.** This automates WhatsApp Web and relocates
-  a session; it may violate WhatsApp's ToS and browser-extension store policies.
-  Get the account owner's explicit consent, and distribute the extension
-  privately/unlisted or via enterprise policy rather than a public listing.
+  client cannot answer a passkey checkpoint and whatsmeow surfaces it as an
+  ordinary logout. Monitor for repeated logouts and re-run the pairing.
+- **Terms of service / store policy.** This automates a `navigator.credentials.
+  get` on `web.whatsapp.com`; it may still touch WhatsApp's ToS and
+  browser-extension store policies. Get the account owner's explicit consent, and
+  prefer private/unlisted or enterprise distribution over a public listing.
 
-## 12. The postMessage protocol
+## 10. The postMessage protocol
 
 The contract between **your page** and the **extension bridge**. All messages are
 `window.postMessage(..., '*')` on the app page; the bridge relays to/from the
@@ -427,18 +430,18 @@ service worker.
 | type | payload | meaning |
 |------|---------|---------|
 | `PING` | - | probe for the extension |
-| `START_PASSKEY_IMPORT` | `{ url }` | begin the flow with a signed upload URL |
-| `CLEAR_AND_CONTINUE` | - | consent to wipe an existing session and continue |
-| `CANCEL_IMPORT` | - | abort the flow |
+| `RUN_PASSKEY_ASSERTION` | `{ requestId, publicKey }` | run `navigator.credentials.get` with this challenge |
 
 **Extension -> page** (receive with `{ source: 'wa-passkey-connector', ... }`):
 
 | type | payload | meaning |
 |------|---------|---------|
 | `CONNECTOR_READY` | - | the extension is installed / present |
-| `EXISTING_SESSION` | `{ number }` | another account is logged in; ask for consent |
-| `IMPORT_SENT` | - | the dump was uploaded; now await your own CONNECTED |
-| `IMPORT_ERROR` | `{ reason }` | `timeout` / `noise_key_unavailable` / `HTTP <n>` / `network` |
+| `PASSKEY_ASSERTION_RESULT` | `{ requestId, assertion? , error? }` | the WebAuthn assertion, or an error reason |
+
+`publicKey` is the browser-shaped mirror of `types.WebAuthnPublicKey`
+(base64url strings); `assertion` is the browser-shaped mirror of
+`types.WebAuthnResponse` (`credential.toJSON()`).
 
 Minimal detection helper:
 
@@ -461,16 +464,37 @@ function detectConnector(timeoutMs = 1500) {
 }
 ```
 
-Start the flow:
+Run one assertion:
 
 ```js
-const { url } = await fetch('/import-url', { method: 'POST' }).then((r) => r.json());
-window.postMessage({ target: 'wa-passkey-connector', type: 'START_PASSKEY_IMPORT', url }, '*');
+function runAssertion(publicKey, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const requestId = crypto.randomUUID();
+    const onMsg = (e) => {
+      if (e.source !== window || e.data?.source !== 'wa-passkey-connector') return;
+      if (e.data?.type !== 'PASSKEY_ASSERTION_RESULT' || e.data?.requestId !== requestId) return;
+      cleanup();
+      e.data.assertion ? resolve(e.data.assertion) : reject(new Error(e.data.error || 'failed'));
+    };
+    const cleanup = () => { window.removeEventListener('message', onMsg); clearTimeout(t); };
+    const t = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, timeoutMs);
+    window.addEventListener('message', onMsg);
+    window.postMessage({ target: 'wa-passkey-connector', type: 'RUN_PASSKEY_ASSERTION', requestId, publicKey }, '*');
+  });
+}
+
+// glue: challenge -> assertion -> your backend
+const { publicKey } = await fetch(`/passkey-challenge/${connId}`).then((r) => r.json());
+const assertion = await runAssertion(publicKey);
+await fetch(`/passkey-response/${connId}`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(assertion),
+});
 ```
 
 ---
 
-*The extension talks to your app via the protocol above and to your backend via a
-single `POST` of the dump to the signed URL. Everything else - how you detect the
-passkey requirement, store the dump, convert it, and import it into whatsmeow -
-is yours to wire into your own architecture using the snippets above.*
+*The extension talks to your app via the protocol above; it produces one WebAuthn
+assertion per challenge and nothing else. Everything else - fetching the
+challenge, relaying it, submitting the assertion to `SendPasskeyResponse`, and
+confirming - is yours to wire into your own architecture using the snippets
+above.*

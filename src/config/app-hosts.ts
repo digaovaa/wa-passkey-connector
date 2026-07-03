@@ -7,8 +7,9 @@
  * 2. Lista fixa — uma entrada por instância (rebuild ao adicionar)
  * 3. Popup — autorize URLs em runtime (optional_host_permissions)
  *
- * O dump POST usa a URL assinada que cada instância envia no fluxo passkey;
- * a origem do frontend precisa estar autorizada aqui ou no popup.
+ * A extensão só precisa da origem do frontend (bridge + postMessage).
+ * O challenge e a assertion trafegam pelo seu backend; a origem do frontend
+ * precisa estar autorizada aqui ou no popup.
  */
 export const DEFAULT_APP_HOSTS = [
   'http://localhost/*',

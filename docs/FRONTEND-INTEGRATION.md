@@ -1,8 +1,15 @@
 # Integração frontend — TOGI Talk Connector
 
-Documento para implementar no frontend do TOGI Talk a comunicação com a extensão **TOGI Talk Connector** (Chrome, Manifest V3).
+Documento para implementar no frontend do TOGI Talk a comunicação com a extensão
+**TOGI Talk Connector** (Chrome, Manifest V3).
 
-A extensão importa a sessão autenticada do WhatsApp Web (incluindo contas **passkey**) e envia o dump para o backend via URL assinada de uso único.
+A extensão **delega a assertion WebAuthn (passkey)** no navegador do dono da
+conta: abre `web.whatsapp.com`, roda `navigator.credentials.get` com o challenge
+do servidor e devolve a assertion. O whatsmeow do backend completa o pareamento
+(`SendPasskeyResponse` / `SendPasskeyConfirmation`). Não há dump de sessão.
+
+Guia genérico (whatsmeow + backend):
+[`WHATSMEOW-IMPLEMENTATION.md`](./WHATSMEOW-IMPLEMENTATION.md).
 
 ---
 
@@ -11,7 +18,9 @@ A extensão importa a sessão autenticada do WhatsApp Web (incluindo contas **pa
 - Usuário com **Google Chrome** (ou Chromium compatível com extensões MV3).
 - Extensão **TOGI Talk Connector** instalada (unpacked ou `.crx`).
 - Conta WhatsApp que exige **passkey** (não pareia via QR headless).
-- Backend com endpoint que gera **URL assinada** para receber o dump (POST JSON).
+- Backend/whatsmeow que:
+  - entrega o challenge (`GetPasskeyRequestOptions` / evento passkey);
+  - recebe a assertion e chama `SendPasskeyResponse` (+ confirmação).
 
 ---
 
@@ -25,7 +34,8 @@ VITE_TOGI_CONNECTOR_EXTENSION_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 VITE_API_BASE_URL=https://api.cliente.togitalk.com.br
 ```
 
-O `EXTENSION_ID` só é necessário para o fallback via `chrome.runtime.sendMessage` (quando o bridge ainda não está injetado na página).
+O `EXTENSION_ID` só é necessário para o fallback via `chrome.runtime.sendMessage`
+(quando o bridge ainda não está injetado na página).
 
 ---
 
@@ -45,12 +55,13 @@ Sempre filtrar `event.source === window` ao receber.
 ```
 1. Página carrega → detectar extensão (PING / CONNECTOR_READY)
 2. Usuário clica "Conectar passkey" (gesto do usuário — importante para permissão Chrome)
-3. Backend gera URL assinada de upload (one-time)
-4. Frontend envia REGISTER_INSTANCE (origens frontend + API)
-5. Chrome pode pedir permissão de host → usuário aceita
-6. Frontend envia START_PASSKEY_IMPORT { url }
-7. Extensão abre WhatsApp Web, força passkey, extrai sessão, POST na url
-8. Frontend recebe IMPORT_SENT → aguardar socket/API ficar online
+3. Frontend envia REGISTER_INSTANCE (origens frontend + API)
+4. Chrome pode pedir permissão de host → usuário aceita
+5. Frontend busca o challenge no backend ({ publicKey })
+6. Frontend envia RUN_PASSKEY_ASSERTION { requestId, publicKey }
+7. Extensão abre WhatsApp Web, roda navigator.credentials.get, devolve assertion
+8. Frontend recebe PASSKEY_ASSERTION_RESULT → POST assertion no backend
+9. Backend/whatsmeow completa o pareamento → status CONNECTED
 ```
 
 ---
@@ -60,16 +71,21 @@ Sempre filtrar `event.source === window` ao receber.
 | type | Campos | Quando usar |
 |------|--------|-------------|
 | `PING` | — | Detectar se a extensão está instalada |
-| `REGISTER_INSTANCE` | `frontendOrigin?`, `apiOrigin?`, `apiUrl?` | **No clique** do botão, antes do import. Registra origens e pede permissão ao Chrome |
-| `START_PASSKEY_IMPORT` | `url` (obrig.), `frontendOrigin?`, `apiOrigin?` | Inicia o fluxo passkey. `url` = URL assinada do backend |
-| `CLEAR_AND_CONTINUE` | — | Usuário confirmou limpar sessão WA Web existente |
-| `CANCEL_IMPORT` | — | Usuário cancelou o fluxo |
+| `REGISTER_INSTANCE` | `frontendOrigin?`, `apiOrigin?`, `apiUrl?` | **No clique** do botão, antes da assertion. Registra origens e pede permissão ao Chrome |
+| `RUN_PASSKEY_ASSERTION` | `requestId`, `publicKey` (obrig.) | Roda `navigator.credentials.get` com o challenge do servidor |
 
 ### Detalhes dos campos
 
-- **`url`** — URL completa do POST (ex.: `https://api.cliente.com/api/pair/TOKEN/capture?sig=...`). A extensão extrai a origem e autoriza automaticamente.
+- **`publicKey`** — objeto WebAuthn no formato do browser (espelho de
+  `types.WebAuthnPublicKey` do whatsmeow): `challenge`, `rpId`,
+  `allowCredentials[]`, `userVerification`, `timeout`, `extensions`. Campos
+  binários em **base64url sem padding**.
+- **`requestId`** — correlaciona o resultado (`PASSKEY_ASSERTION_RESULT`). Use
+  `crypto.randomUUID()`.
 - **`frontendOrigin`** — Opcional; default `window.location.origin`.
-- **`apiOrigin`** — Opcional; use quando a API está em domínio diferente do frontend (ex.: `https://api.cliente.com`).
+- **`apiOrigin`** — Opcional; use quando a API está em domínio diferente do
+  frontend (ex.: `https://api.cliente.com`). Útil se o bridge/fallback externo
+  precisar da origem da API autorizada.
 
 ---
 
@@ -79,28 +95,27 @@ Sempre filtrar `event.source === window` ao receber.
 |------|--------|-------------|
 | `CONNECTOR_READY` | — | Extensão instalada e bridge ativo na página |
 | `REGISTER_INSTANCE_RESULT` | `ok`, `error?`, `authorized?`, `needsPermission?` | Resultado do registro de instância |
-| `EXISTING_SESSION` | `number` | Já existe login no WhatsApp Web local; pedir consentimento ao usuário |
-| `IMPORT_SENT` | — | Dump enviado com sucesso ao backend |
-| `IMPORT_ERROR` | `reason`, `error?` | Falha no fluxo |
+| `PASSKEY_ASSERTION_RESULT` | `requestId`, `assertion?`, `error?` | Assertion WebAuthn ou motivo de erro |
 
-### Valores de `reason` em `IMPORT_ERROR`
+### Valores de `error` em `PASSKEY_ASSERTION_RESULT`
 
-| reason | Ação sugerida na UI |
-|--------|---------------------|
-| `timeout` | Sessão não completou a tempo; pedir para tentar de novo |
-| `noise_key_unavailable` | Versão/build do WhatsApp Web incompatível; recarregar aba ou tentar depois |
-| `permission_denied` | Usuário negou permissão de host; orientar a aceitar no Chrome |
-| `HTTP <status>` | Backend rejeitou o dump; mostrar erro e logs |
-| `network` | Falha de rede ao POST; verificar CORS/URL/conectividade |
+| error | Ação sugerida na UI |
+|-------|---------------------|
+| `tab_open_failed` | Não abriu a aba do WhatsApp Web; tentar de novo |
+| `assertion_failed` | Usuário cancelou ou a assertion não completou |
+| `assertion_exception` / mensagem do browser | Falha no WebAuthn; mostrar e permitir retry |
+| mensagem do `DOMException` | Ex.: `NotAllowedError` (usuário cancelou o prompt) |
 
 ---
 
-## Backend: endpoint de upload
+## Backend: challenge e assertion
 
-Antes de `START_PASSKEY_IMPORT`, o frontend deve obter do **seu backend** uma URL assinada de uso único:
+O frontend **não** manda a assertion pela extensão — ele recebe e faz o POST.
+
+### Challenge
 
 ```http
-POST /api/pair/{token}/import-url
+GET /api/pair/{token}/passkey-challenge
 Authorization: Bearer ...
 ```
 
@@ -108,20 +123,33 @@ Resposta esperada:
 
 ```json
 {
-  "url": "https://api.cliente.com/api/pair/abc123/capture?expires=...&sig=..."
+  "publicKey": {
+    "challenge": "...",
+    "rpId": "whatsapp.com",
+    "timeout": 600000,
+    "allowCredentials": [],
+    "userVerification": "preferred"
+  }
 }
 ```
 
-A extensão fará:
+Mint on demand (no clique do usuário). Challenge é **single-use** com TTL curto.
+
+### Assertion
 
 ```http
-POST {url}
+POST /api/pair/{token}/passkey-response
+Authorization: Bearer ...
 Content-Type: application/json
 
-{ ... dump da sessão WhatsApp Web ... }
+{ "id": "...", "rawId": "...", "type": "public-key", "response": { ... } }
 ```
 
-O backend converte o dump (ex.: `wa-store-migrate`) e importa no whatsmeow/Baileys.
+Encaminhe **verbatim** (strings base64url sem padding) ao worker whatsmeow
+(`SendPasskeyResponse`). Não re-encode em Buffer/base64 padrão.
+
+Os paths acima são exemplos — use as rotas que o seu backend já expõe, desde que
+entreguem `{ publicKey }` e aceitem o corpo da assertion.
 
 ---
 
@@ -144,13 +172,10 @@ type ConnectorOutbound =
     }
   | {
       target: typeof CONNECTOR_TARGET;
-      type: 'START_PASSKEY_IMPORT';
-      url: string;
-      frontendOrigin?: string;
-      apiOrigin?: string;
-    }
-  | { target: typeof CONNECTOR_TARGET; type: 'CLEAR_AND_CONTINUE' }
-  | { target: typeof CONNECTOR_TARGET; type: 'CANCEL_IMPORT' };
+      type: 'RUN_PASSKEY_ASSERTION';
+      requestId: string;
+      publicKey: unknown;
+    };
 
 type ConnectorInbound =
   | { source: typeof CONNECTOR_SOURCE; type: 'CONNECTOR_READY' }
@@ -162,12 +187,11 @@ type ConnectorInbound =
       authorized?: string[];
       needsPermission?: boolean;
     }
-  | { source: typeof CONNECTOR_SOURCE; type: 'EXISTING_SESSION'; number: string }
-  | { source: typeof CONNECTOR_SOURCE; type: 'IMPORT_SENT' }
   | {
       source: typeof CONNECTOR_SOURCE;
-      type: 'IMPORT_ERROR';
-      reason: string;
+      type: 'PASSKEY_ASSERTION_RESULT';
+      requestId?: string;
+      assertion?: unknown;
       error?: string;
     };
 
@@ -251,6 +275,48 @@ export function registerInstance(opts: {
 }
 ```
 
+### Rodar a assertion
+
+```typescript
+export function runPasskeyAssertion(
+  publicKey: unknown,
+  timeoutMs = 120_000,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const requestId = crypto.randomUUID();
+
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== window) return;
+      const data = event.data as ConnectorInbound;
+      if (data?.source !== CONNECTOR_SOURCE) return;
+      if (data.type !== 'PASSKEY_ASSERTION_RESULT') return;
+      if (data.requestId !== requestId) return;
+      cleanup();
+      if (data.assertion) resolve(data.assertion);
+      else reject(new Error(data.error || 'assertion_failed'));
+    };
+
+    const cleanup = () => {
+      window.removeEventListener('message', onMessage);
+      clearTimeout(timer);
+    };
+
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('timeout'));
+    }, timeoutMs);
+
+    window.addEventListener('message', onMessage);
+    postToConnector({
+      target: CONNECTOR_TARGET,
+      type: 'RUN_PASSKEY_ASSERTION',
+      requestId,
+      publicKey,
+    });
+  });
+}
+```
+
 ### Fallback: mensagem externa (bridge ainda não injetado)
 
 Use quando `waitForConnector()` retorna `false` mas você sabe que a extensão está instalada:
@@ -291,23 +357,21 @@ export function registerInstanceExternal(opts: {
 ## Hook React sugerido
 
 ```typescript
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 type PasskeyFlowState =
   | 'idle'
   | 'checking_extension'
   | 'registering'
   | 'awaiting_passkey'
-  | 'existing_session'
-  | 'importing'
+  | 'submitting'
   | 'success'
   | 'error';
 
-export function usePasskeyConnector(apiBaseUrl: string) {
+export function usePasskeyConnector(apiBaseUrl: string, connectionId: string) {
   const [installed, setInstalled] = useState<boolean | null>(null);
   const [state, setState] = useState<PasskeyFlowState>('idle');
   const [error, setError] = useState<string | null>(null);
-  const [existingNumber, setExistingNumber] = useState<string | null>(null);
   const apiOrigin = new URL(apiBaseUrl).origin;
 
   useEffect(() => {
@@ -315,32 +379,7 @@ export function usePasskeyConnector(apiBaseUrl: string) {
     waitForConnector().then(setInstalled);
   }, []);
 
-  useEffect(() => {
-    const onMessage = (event: MessageEvent) => {
-      if (event.source !== window) return;
-      const data = event.data;
-      if (data?.source !== CONNECTOR_SOURCE) return;
-
-      switch (data.type) {
-        case 'EXISTING_SESSION':
-          setExistingNumber(data.number);
-          setState('existing_session');
-          break;
-        case 'IMPORT_SENT':
-          setState('success');
-          break;
-        case 'IMPORT_ERROR':
-          setError(data.error ?? data.reason);
-          setState('error');
-          break;
-      }
-    };
-
-    window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
-  }, []);
-
-  const startPasskeyImport = useCallback(async () => {
+  const startPasskeyPairing = useCallback(async () => {
     setError(null);
     setState('registering');
 
@@ -351,43 +390,36 @@ export function usePasskeyConnector(apiBaseUrl: string) {
       return;
     }
 
-    const { url } = await fetch(`${apiBaseUrl}/api/pair/import-url`, {
-      method: 'POST',
-      credentials: 'include',
-    }).then((r) => r.json());
-
     setState('awaiting_passkey');
 
-    postToConnector({
-      target: CONNECTOR_TARGET,
-      type: 'START_PASSKEY_IMPORT',
-      url,
-      frontendOrigin: window.location.origin,
-      apiOrigin,
-    });
+    try {
+      const { publicKey } = await fetch(
+        `${apiBaseUrl}/api/pair/${connectionId}/passkey-challenge`,
+        { credentials: 'include' },
+      ).then((r) => r.json());
 
-    setState('importing');
-  }, [apiBaseUrl, apiOrigin]);
+      const assertion = await runPasskeyAssertion(publicKey);
 
-  const confirmClearSession = useCallback(() => {
-    postToConnector({ target: CONNECTOR_TARGET, type: 'CLEAR_AND_CONTINUE' });
-    setExistingNumber(null);
-    setState('importing');
-  }, []);
+      setState('submitting');
+      await fetch(`${apiBaseUrl}/api/pair/${connectionId}/passkey-response`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(assertion),
+      });
 
-  const cancelImport = useCallback(() => {
-    postToConnector({ target: CONNECTOR_TARGET, type: 'CANCEL_IMPORT' });
-    setState('idle');
-  }, []);
+      setState('success');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setState('error');
+    }
+  }, [apiBaseUrl, apiOrigin, connectionId]);
 
   return {
     installed,
     state,
     error,
-    existingNumber,
-    startPasskeyImport,
-    confirmClearSession,
-    cancelImport,
+    startPasskeyPairing,
   };
 }
 ```
@@ -405,25 +437,19 @@ export function usePasskeyConnector(apiBaseUrl: string) {
 
 > Botão **Conectar com passkey**
 
-### Estado: `existing_session`
+### Estado: `awaiting_passkey`
 
-> Detectamos um WhatsApp Web logado neste navegador (`{number}`).
-> Para continuar, a sessão local será limpa após a importação.
-> [Continuar] [Cancelar]
+> Confirme a passkey na aba do WhatsApp Web que abriu (e o PIN de 2FA, se houver)...
 
-### Estado: `importing`
+### Estado: `submitting` / `success`
 
-> Autentique com sua passkey na aba do WhatsApp Web que abriu...
+> Assertion enviada. Aguardando conexão online...
 
-### Estado: `success`
-
-> Sessão importada. Aguardando conexão online...
-
-(Polling no seu backend até `status === 'open'`.)
+(Polling no seu backend até `status === 'open'` / `CONNECTED`.)
 
 ### Estado: `error`
 
-> Falha: `{reason}`. [Tentar novamente]
+> Falha: `{error}`. [Tentar novamente] (um retry precisa de **novo** challenge)
 
 ---
 
@@ -447,14 +473,15 @@ Na primeira vez por origem, o Chrome exibe diálogo de permissão — isso é ob
 ## Checklist de implementação
 
 - [ ] Detectar extensão na tela de conexão passkey (`waitForConnector`)
-- [ ] Botão "Conectar passkey" chama `registerInstance` + `START_PASSKEY_IMPORT`
-- [ ] Backend expõe endpoint que retorna `{ url }` assinada
-- [ ] Listener de `IMPORT_SENT` / `IMPORT_ERROR` / `EXISTING_SESSION`
-- [ ] Modal de consentimento para `EXISTING_SESSION` → `CLEAR_AND_CONTINUE` ou `CANCEL_IMPORT`
-- [ ] Polling do status da instância após `IMPORT_SENT`
+- [ ] Botão "Conectar passkey" chama `registerInstance` + challenge + `RUN_PASSKEY_ASSERTION`
+- [ ] Backend expõe challenge (`{ publicKey }`) e recebe assertion
+- [ ] Listener / promise de `PASSKEY_ASSERTION_RESULT` correlacionado por `requestId`
+- [ ] POST da assertion **verbatim** (base64url sem padding) ao backend
+- [ ] Polling do status da instância após o POST
 - [ ] Mensagem clara se `needsPermission` ou extensão ausente
 - [ ] `VITE_TOGI_CONNECTOR_EXTENSION_ID` no `.env` (fallback externo)
 - [ ] Testar com API em subdomínio diferente do frontend (`apiOrigin`)
+- [ ] Retry sempre pede **novo** challenge (single-use)
 
 ---
 
@@ -462,12 +489,14 @@ Na primeira vez por origem, o Chrome exibe diálogo de permissão — isso é ob
 
 - Não hardcodar URLs de instâncias no frontend — use `window.location.origin` e `apiBaseUrl` do env.
 - Não chamar `REGISTER_INSTANCE` fora de um clique do usuário (Chrome pode bloquear `permissions.request`).
-- Não esperar resposta síncrona de `START_PASSKEY_IMPORT` — o resultado vem via `IMPORT_SENT` / `IMPORT_ERROR`.
-- Não armazenar ou logar a URL assinada de upload (contém credencial de one-time upload).
+- Não re-encodear campos base64url da assertion (quebra a verificação no servidor).
+- Não armazenar challenge nem assertion — são one-shot.
+- Não usar o fluxo antigo (`START_PASSKEY_IMPORT` / dump de sessão) — removido.
 
 ---
 
 ## Referência
 
 Extensão: repositório `wa-passkey-connector` / **TOGI Talk Connector**  
-Protocolo interno: `source` / `target` = `'wa-passkey-connector'`
+Protocolo interno: `source` / `target` = `'wa-passkey-connector'`  
+whatsmeow: [`docs/WHATSMEOW-IMPLEMENTATION.md`](./WHATSMEOW-IMPLEMENTATION.md)

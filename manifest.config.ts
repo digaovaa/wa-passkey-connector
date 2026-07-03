@@ -10,25 +10,19 @@ const icons = {
 export default defineManifest({
   manifest_version: 3,
   name: 'TOGI Talk Connector',
-  version: '0.1.0',
+  version: '0.2.0',
   description:
-    'Conecta contas WhatsApp com passkey ao TOGI Talk via sessão autenticada do WhatsApp Web.',
+    'Executa a assertion passkey (WebAuthn) do WhatsApp no navegador do dono da conta para parear com o TOGI Talk.',
   icons,
   action: { default_popup: 'index.html', default_icon: icons },
   background: { service_worker: 'src/background/index.ts', type: 'module' },
-  permissions: ['scripting', 'tabs', 'activeTab', 'storage', 'browsingData'],
+  permissions: ['scripting', 'tabs', 'activeTab', 'storage'],
   host_permissions: ['https://web.whatsapp.com/*', ...DEFAULT_APP_HOSTS],
   optional_host_permissions: ['http://*/*', 'https://*/*'],
   externally_connectable: {
     matches: ['http://*/*', 'https://*/*'],
   },
   content_scripts: [
-    {
-      matches: ['https://web.whatsapp.com/*'],
-      js: ['src/content/wa-web-dump.js'],
-      world: 'MAIN',
-      run_at: 'document_idle',
-    },
     {
       matches: DEFAULT_APP_HOSTS,
       js: ['src/content/app-bridge.ts'],
