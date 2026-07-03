@@ -5,10 +5,10 @@ type Variant = 'default' | 'outline' | 'ghost' | 'destructive';
 type Size = 'default' | 'sm' | 'icon';
 
 const variants: Record<Variant, string> = {
-  default: 'bg-primary text-primary-foreground hover:bg-primary/90',
+  default: 'bg-primary text-primary-foreground hover:bg-primary/90 shadow-sm',
   outline:
-    'border border-input bg-background hover:bg-accent hover:text-accent-foreground',
-  ghost: 'hover:bg-accent hover:text-accent-foreground',
+    'border border-input bg-background hover:bg-accent/50 hover:text-accent-foreground',
+  ghost: 'hover:bg-muted/80 hover:text-foreground',
   destructive:
     'bg-destructive text-destructive-foreground hover:bg-destructive/90',
 };

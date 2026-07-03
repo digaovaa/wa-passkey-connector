@@ -1,4 +1,5 @@
 import { defineManifest } from '@crxjs/vite-plugin';
+import { DEFAULT_APP_HOSTS } from './src/config/app-hosts';
 
 const icons = {
   '16': 'icons/icon16.png',
@@ -6,19 +7,21 @@ const icons = {
   '128': 'icons/icon128.png',
 };
 
-const APP_HOSTS = ['https://your-app.example.com/*'];
-
 export default defineManifest({
   manifest_version: 3,
-  name: 'WA Passkey Connector',
+  name: 'TOGI Talk Connector',
   version: '0.1.0',
   description:
-    'Imports an authenticated WhatsApp Web session into your app to pair a passkey-locked account.',
+    'Conecta contas WhatsApp com passkey ao TOGI Talk via sessão autenticada do WhatsApp Web.',
   icons,
   action: { default_popup: 'index.html', default_icon: icons },
   background: { service_worker: 'src/background/index.ts', type: 'module' },
   permissions: ['scripting', 'tabs', 'activeTab', 'storage', 'browsingData'],
-  host_permissions: ['https://web.whatsapp.com/*', ...APP_HOSTS],
+  host_permissions: ['https://web.whatsapp.com/*', ...DEFAULT_APP_HOSTS],
+  optional_host_permissions: ['http://*/*', 'https://*/*'],
+  externally_connectable: {
+    matches: ['http://*/*', 'https://*/*'],
+  },
   content_scripts: [
     {
       matches: ['https://web.whatsapp.com/*'],
@@ -27,7 +30,7 @@ export default defineManifest({
       run_at: 'document_idle',
     },
     {
-      matches: APP_HOSTS,
+      matches: DEFAULT_APP_HOSTS,
       js: ['src/content/app-bridge.ts'],
       run_at: 'document_start',
     },

@@ -1,3 +1,14 @@
+import {
+  authorizeOrigin,
+  getInstances,
+  injectBridgeIntoOpenTabs,
+  injectBridgeIntoTab,
+  maybeInjectBridge,
+  registerInstanceOrigins,
+  removeAuthorizedOrigin,
+  type RegisterInstanceInput,
+} from '@/lib/connector';
+
 interface Pending {
   url: string;
   tabId?: number;
@@ -6,71 +17,162 @@ interface Pending {
   awaitingConsent?: boolean;
   consented?: boolean;
   noiseFails?: number;
+  /** Quando true, força SHORTCAKE_PASSKEY no WA Web. Default false = QR / telefone (fluxo Ticketz). */
+  forcePasskey?: boolean;
 }
 
 const MAX_POLLS = 120;
 const WA_ORIGIN = 'https://web.whatsapp.com';
-const APP_HOST_PATTERNS = ['https://your-app.example.com/*'];
 
 let pending: Pending | null = null;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 let pendingConfirmJid: string | undefined;
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.type === 'START_PASSKEY_IMPORT' && typeof msg.url === 'string') {
-    void startImport(msg.url, sender.tab?.id).then(sendResponse);
+function handleMessage(
+  msg: RegisterInstanceInput & {
+    type?: string;
+    url?: string;
+    origin?: string;
+    frontendOrigin?: string;
+    apiOrigin?: string;
+    forcePasskey?: boolean;
+  },
+  sender: chrome.runtime.MessageSender,
+  sendResponse: (response?: unknown) => void,
+): boolean {
+  const tabId = sender.tab?.id;
+
+  if (msg?.type === 'REGISTER_INSTANCE') {
+    void handleRegisterInstance(
+      {
+        frontendOrigin: msg.frontendOrigin ?? sender.url ?? undefined,
+        apiOrigin: msg.apiOrigin,
+        apiUrl: msg.apiUrl,
+      },
+      tabId,
+    ).then(sendResponse);
     return true;
   }
+
+  if (msg?.type === 'START_PASSKEY_IMPORT' && typeof msg.url === 'string') {
+    void startImport(msg.url, tabId, {
+      frontendOrigin: msg.frontendOrigin ?? sender.url ?? undefined,
+      apiOrigin: msg.apiOrigin,
+      forcePasskey: msg.forcePasskey === true,
+    }).then(sendResponse);
+    return true;
+  }
+
   if (msg?.type === 'CLEAR_AND_CONTINUE') {
     void clearAndContinue().then(sendResponse);
     return true;
   }
+
   if (msg?.type === 'CANCEL_IMPORT') {
     cancelImport();
     sendResponse({ ok: true });
     return false;
   }
-  if (msg?.type === 'IS_CONNECTOR_INSTALLED') {
-    sendResponse({ installed: true });
+
+  if (msg?.type === 'IS_CONNECTOR_INSTALLED' || msg?.type === 'PING') {
+    sendResponse({ installed: true, ok: true });
     return false;
   }
+
+  if (msg?.type === 'GET_INSTANCES') {
+    void getInstances().then(sendResponse);
+    return true;
+  }
+
+  if (msg?.type === 'AUTHORIZE_INSTANCE' && typeof msg.origin === 'string') {
+    void authorizeOrigin(msg.origin).then((result) => {
+      if (result.ok) void injectBridgeIntoOpenTabs();
+      sendResponse(result);
+    });
+    return true;
+  }
+
+  if (msg?.type === 'REMOVE_INSTANCE' && typeof msg.origin === 'string') {
+    void removeAuthorizedOrigin(msg.origin).then(sendResponse);
+    return true;
+  }
+
   return false;
-});
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) =>
+  handleMessage(msg, sender, sendResponse),
+);
+
+chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) =>
+  handleMessage(msg, sender, sendResponse),
+);
 
 chrome.runtime.onInstalled.addListener(() => {
   void injectBridgeIntoOpenTabs();
 });
 
-async function injectBridgeIntoOpenTabs() {
-  try {
-    const tabs = await chrome.tabs.query({ url: APP_HOST_PATTERNS });
-    for (const tab of tabs) {
-      if (tab.id == null) continue;
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: bridgeInPage,
-        });
-      } catch {
-        void 0;
-      }
-    }
-  } catch {
-    void 0;
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.togitalk_authorized_hosts) {
+    void injectBridgeIntoOpenTabs();
   }
+});
+
+async function handleRegisterInstance(
+  input: RegisterInstanceInput,
+  tabId?: number,
+) {
+  const result = await registerInstanceOrigins(input);
+  if (result.ok) {
+    if (tabId != null) {
+      await injectBridgeIntoTab(tabId);
+    } else {
+      await injectBridgeIntoOpenTabs();
+    }
+  }
+  if (tabId != null && result.ok) {
+    notifyTab(tabId, 'REGISTER_INSTANCE_RESULT', result);
+  }
+  return result;
 }
 
 async function startImport(
   url: string,
   originTabId?: number,
-): Promise<{ ok: boolean }> {
+  origins?: { frontendOrigin?: string; apiOrigin?: string; forcePasskey?: boolean },
+): Promise<{ ok: boolean; error?: string; needsPermission?: boolean }> {
+  const reg = await registerInstanceOrigins({
+    apiUrl: url,
+    frontendOrigin: origins?.frontendOrigin,
+    apiOrigin: origins?.apiOrigin,
+  });
+  if (!reg.ok) return reg;
+
+  if (originTabId != null) {
+    await injectBridgeIntoTab(originTabId);
+  }
+
   stopPoll();
-  const tab = await chrome.tabs.create({ url: `${WA_ORIGIN}/`, active: false });
-  pending = { url, tabId: tab.id, originTabId, attempts: 0 };
+  pendingConfirmJid = undefined;
+
+  await closeExistingWaTabs();
+  await wipeWhatsAppData();
+
+  const tab = await chrome.tabs.create({ url: `${WA_ORIGIN}/`, active: true });
+  pending = {
+    url,
+    tabId: tab.id,
+    originTabId,
+    attempts: 0,
+    forcePasskey: origins?.forcePasskey === true,
+  };
   return { ok: true };
 }
 
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (info.status === 'complete' && tab.url) {
+    void maybeInjectBridge(tabId, tab.url);
+  }
   if (!pending || pending.tabId !== tabId) return;
   if (info.status === 'complete' && tab.url?.startsWith(`${WA_ORIGIN}/`)) {
     void onReady(tabId);
@@ -94,7 +196,7 @@ async function onReady(tabId: number) {
       return;
     }
   }
-  await activateAndForce(tabId);
+  await activateTab(tabId);
 }
 
 async function readExistingWid(tabId: number): Promise<string> {
@@ -118,22 +220,35 @@ async function readExistingWid(tabId: number): Promise<string> {
   }
 }
 
-async function activateAndForce(tabId: number) {
+async function activateTab(tabId: number) {
   try {
     await chrome.tabs.update(tabId, { active: true });
   } catch {
     void 0;
   }
+  if (pending?.forcePasskey) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        func: forcePasskeyModeInPage,
+      });
+    } catch {
+      void 0;
+    }
+  }
+  startPoll(tabId);
+}
+
+async function closeExistingWaTabs() {
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: forcePasskeyModeInPage,
-    });
+    const tabs = await chrome.tabs.query({ url: `${WA_ORIGIN}/*` });
+    await Promise.all(
+      tabs.map((tab) => (tab.id != null ? chrome.tabs.remove(tab.id).catch(() => {}) : undefined)),
+    );
   } catch {
     void 0;
   }
-  startPoll(tabId);
 }
 
 async function wipeWhatsAppData() {
@@ -177,10 +292,14 @@ function cancelImport() {
   }
 }
 
+function notifyTab(tabId: number, type: string, extra: Record<string, unknown> = {}) {
+  void chrome.tabs.sendMessage(tabId, { type, ...extra }).catch(() => {});
+}
+
 function notifyOrigin(type: string, extra: Record<string, unknown> = {}) {
   const originTabId = pending?.originTabId;
   if (originTabId == null) return;
-  void chrome.tabs.sendMessage(originTabId, { type, ...extra }).catch(() => {});
+  notifyTab(originTabId, type, extra);
 }
 
 function startPoll(tabId: number) {
@@ -288,6 +407,18 @@ function isCompleteDump(
 async function postDump(tabId: number, dump: WebSessionDump) {
   const url = pending?.url;
   if (!url) return;
+
+  const perm = await registerInstanceOrigins({ apiUrl: url });
+  if (!perm.ok) {
+    notifyOrigin('IMPORT_ERROR', {
+      reason: perm.needsPermission ? 'permission_denied' : 'network',
+      error: perm.error,
+    });
+    pending = null;
+    pendingConfirmJid = undefined;
+    return;
+  }
+
   try {
     const resp = await fetch(url, {
       method: 'POST',
@@ -360,41 +491,4 @@ function forcePasskeyModeInPage() {
   };
 
   attempt(0);
-}
-
-function bridgeInPage() {
-  const SOURCE = 'wa-passkey-connector';
-  const w = window as unknown as { __waPasskeyConnectorBridge?: boolean };
-  if (w.__waPasskeyConnectorBridge) return;
-  w.__waPasskeyConnectorBridge = true;
-
-  const announce = () =>
-    window.postMessage({ source: SOURCE, type: 'CONNECTOR_READY' }, '*');
-
-  const fromWorker = ['EXISTING_SESSION', 'IMPORT_SENT', 'IMPORT_ERROR'];
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && typeof msg.type === 'string' && fromWorker.includes(msg.type)) {
-      window.postMessage({ source: SOURCE, ...msg }, '*');
-    }
-  });
-
-  window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    const data = event.data as
-      | { target?: string; type?: string; url?: string }
-      | undefined;
-    if (!data || data.target !== SOURCE) return;
-    if (data.type === 'PING') announce();
-    if (data.type === 'START_PASSKEY_IMPORT' && typeof data.url === 'string') {
-      void chrome.runtime.sendMessage({
-        type: 'START_PASSKEY_IMPORT',
-        url: data.url,
-      });
-    }
-    if (data.type === 'CLEAR_AND_CONTINUE' || data.type === 'CANCEL_IMPORT') {
-      void chrome.runtime.sendMessage({ type: data.type });
-    }
-  });
-
-  announce();
 }
