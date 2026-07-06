@@ -120,12 +120,7 @@ async function handlePasskeyAssertion(
   publicKey: unknown,
   originTabId: number | undefined,
   requestId: string | undefined,
-): Promise<{
-  ok: boolean;
-  requestId?: string;
-  assertion?: unknown;
-  error?: string;
-}> {
+): Promise<{ ok: boolean }> {
   const reply = (payload: Record<string, unknown>) => {
     if (originTabId == null) return;
     notifyTab(originTabId, 'PASSKEY_ASSERTION_RESULT', {
@@ -139,9 +134,8 @@ async function handlePasskeyAssertion(
     const tab = await chrome.tabs.create({ url: `${WA_ORIGIN}/`, active: true });
     tabId = tab.id;
     if (tabId == null) {
-      const error = 'tab_open_failed';
-      reply({ error });
-      return { ok: false, requestId, error };
+      reply({ error: 'tab_open_failed' });
+      return { ok: false };
     }
     await waitForTabComplete(tabId);
     const [inj] = await chrome.scripting.executeScript({
@@ -155,17 +149,15 @@ async function handlePasskeyAssertion(
       | undefined;
     if (result?.assertion) {
       reply({ assertion: result.assertion });
-      // sendResponse também devolve a assertion (fallback externo sem tabId).
-      return { ok: true, requestId, assertion: result.assertion };
+    } else {
+      reply({ error: result?.error || 'assertion_failed' });
     }
-    const error = result?.error || 'assertion_failed';
-    reply({ error });
-    return { ok: false, requestId, error };
+    return { ok: true };
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : 'assertion_exception';
-    reply({ error: message });
-    return { ok: false, requestId, error: message };
+    reply({
+      error: error instanceof Error ? error.message : 'assertion_exception',
+    });
+    return { ok: false };
   } finally {
     if (tabId != null) void chrome.tabs.remove(tabId).catch(() => {});
   }
