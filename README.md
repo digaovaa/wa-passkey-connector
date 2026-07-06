@@ -15,7 +15,7 @@ not a copy of the owner's session. No session dump, no headless bypass.
 > **Full end-to-end guide (whatsmeow + backend + UI + this extension):**
 > [`docs/WHATSMEOW-IMPLEMENTATION.md`](docs/WHATSMEOW-IMPLEMENTATION.md).
 >
-> **TOGI Talk frontend integration (multi-tenant):**
+> **Frontend integration (URL dinâmica da API):**
 > [`docs/FRONTEND-INTEGRATION.md`](docs/FRONTEND-INTEGRATION.md).
 
 ## What this extension does
@@ -31,8 +31,8 @@ and with **any** backend/whatsmeow worker through the assertion round trip. See
 the protocol in
 [the guide](docs/WHATSMEOW-IMPLEMENTATION.md#10-the-postmessage-protocol).
 
-Multi-tenant hosts are authorized at runtime via `REGISTER_INSTANCE` (or the
-popup), using `optional_host_permissions` — no rebuild per customer origin.
+Host permissions for your app are requested at runtime from the URL the frontend
+sends (`apiOrigin` / `apiUrl` in `RUN_PASSKEY_ASSERTION`) — no rebuild per customer.
 
 ## Quick start
 
@@ -41,11 +41,12 @@ npm install
 npm run build      # -> dist/  (unpacked extension)
 ```
 
-1. Edit **`src/config/app-hosts.ts`** and set `DEFAULT_APP_HOSTS` to the
-   origin(s) where your web app runs (add `http://localhost/*` for local dev).
-2. `npm run build`.
-3. Load it in Chrome: `chrome://extensions` -> enable Developer mode -> **Load
+1. `npm run build`.
+2. Load it in Chrome: `chrome://extensions` -> enable Developer mode -> **Load
    unpacked** -> select the `dist/` folder.
+
+For local dev, the content script auto-loads on `localhost`. In production the
+extension injects the bridge after the user grants host permission.
 
 Package a signed `.crx` with `npm run pack` (generate `key.pem` first, keep it
 private, never commit it).
@@ -63,29 +64,28 @@ window.addEventListener('message', (e) => {
 });
 window.postMessage({ target: 'wa-passkey-connector', type: 'PING' }, '*');
 
-// 2. authorize this instance (user gesture — click handler)
-window.postMessage({
-  target: 'wa-passkey-connector',
-  type: 'REGISTER_INSTANCE',
-  frontendOrigin: window.location.origin,
-  apiOrigin: 'https://api.example.com',
-}, '*');
-
-// 3. get the challenge from your backend, run the assertion, post it back
+// 2. get the challenge from your backend, run the assertion (send API URL), post it back
 const requestId = crypto.randomUUID();
-const { publicKey } = await fetch(`/passkey-challenge/${connId}`).then((r) => r.json());
+const apiOrigin = 'https://api.example.com';
+const { publicKey } = await fetch(`${apiOrigin}/passkey-challenge/${connId}`).then((r) => r.json());
 window.addEventListener('message', async (e) => {
   if (e.data?.source !== 'wa-passkey-connector') return;
   if (e.data.type === 'PASSKEY_ASSERTION_RESULT' && e.data.requestId === requestId) {
     if (e.data.assertion) {
-      await fetch(`/passkey-response/${connId}`, {
+      await fetch(`${apiOrigin}/passkey-response/${connId}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(e.data.assertion),
       });
     }
   }
 });
-window.postMessage({ target: 'wa-passkey-connector', type: 'RUN_PASSKEY_ASSERTION', requestId, publicKey }, '*');
+window.postMessage({
+  target: 'wa-passkey-connector',
+  type: 'RUN_PASSKEY_ASSERTION',
+  requestId,
+  publicKey,
+  apiOrigin,
+}, '*');
 ```
 
 Full message table and the whatsmeow-side snippets (`GetPasskeyRequestOptions`,

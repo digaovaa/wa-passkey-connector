@@ -1,4 +1,4 @@
-import { DEFAULT_APP_HOSTS, STORAGE_KEY_AUTHORIZED } from '@/config/app-hosts';
+import { DEV_APP_HOSTS, STORAGE_KEY_AUTHORIZED } from '@/config/app-hosts';
 
 export function normalizeOriginInput(input: string): string {
   const trimmed = input.trim().replace(/\/+$/, '');
@@ -56,7 +56,7 @@ export async function saveStoredOrigins(origins: string[]): Promise<void> {
 
 export async function getAllHostPatterns(): Promise<string[]> {
   const stored = await readStoredOrigins();
-  return mergeHostPatterns(DEFAULT_APP_HOSTS, stored);
+  return mergeHostPatterns(DEV_APP_HOSTS, stored);
 }
 
 export async function urlIsAuthorizedAppUrl(url: string): Promise<boolean> {

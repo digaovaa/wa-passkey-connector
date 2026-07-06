@@ -1,7 +1,7 @@
-# Integração frontend — TOGI Talk Connector
+# Integração frontend — Conector WA
 
-Documento para implementar no frontend do TOGI Talk a comunicação com a extensão
-**TOGI Talk Connector** (Chrome, Manifest V3).
+Documento para implementar no frontend da sua aplicação a comunicação com a extensão
+**Conector WA** (Chrome, Manifest V3).
 
 A extensão **delega a assertion WebAuthn (passkey)** no navegador do dono da
 conta: abre `web.whatsapp.com`, roda `navigator.credentials.get` com o challenge
@@ -16,7 +16,7 @@ Guia genérico (whatsmeow + backend):
 ## Pré-requisitos
 
 - Usuário com **Google Chrome** (ou Chromium compatível com extensões MV3).
-- Extensão **TOGI Talk Connector** instalada (unpacked ou `.crx`).
+- Extensão **Conector WA** instalada (unpacked ou `.crx`).
 - Conta WhatsApp que exige **passkey** (não pareia via QR headless).
 - Backend/whatsmeow que:
   - entrega o challenge (`GetPasskeyRequestOptions` / evento passkey);
@@ -28,10 +28,10 @@ Guia genérico (whatsmeow + backend):
 
 ```env
 # ID fixo da extensão (obtido em chrome://extensions — útil para fallback externo)
-VITE_TOGI_CONNECTOR_EXTENSION_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+VITE_CONNECTOR_EXTENSION_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Base da API desta instância (se diferente do origin do frontend)
-VITE_API_BASE_URL=https://api.cliente.togitalk.com.br
+VITE_API_BASE_URL=https://api.cliente.seudominio.com
 ```
 
 O `EXTENSION_ID` só é necessário para o fallback via `chrome.runtime.sendMessage`
@@ -55,13 +55,12 @@ Sempre filtrar `event.source === window` ao receber.
 ```
 1. Página carrega → detectar extensão (PING / CONNECTOR_READY)
 2. Usuário clica "Conectar passkey" (gesto do usuário — importante para permissão Chrome)
-3. Frontend envia REGISTER_INSTANCE (origens frontend + API)
-4. Chrome pode pedir permissão de host → usuário aceita
-5. Frontend busca o challenge no backend ({ publicKey })
-6. Frontend envia RUN_PASSKEY_ASSERTION { requestId, publicKey }
-7. Extensão abre WhatsApp Web, roda navigator.credentials.get, devolve assertion
-8. Frontend recebe PASSKEY_ASSERTION_RESULT → POST assertion no backend
-9. Backend/whatsmeow completa o pareamento → status CONNECTED
+3. Frontend busca o challenge no backend ({ publicKey })
+4. Frontend envia RUN_PASSKEY_ASSERTION { requestId, publicKey, apiOrigin ou apiUrl }
+5. Chrome pode pedir permissão de host → usuário aceita (primeira vez por origem)
+6. Extensão abre WhatsApp Web, roda navigator.credentials.get, devolve assertion
+7. Frontend recebe PASSKEY_ASSERTION_RESULT → POST assertion no backend
+8. Backend/whatsmeow completa o pareamento → status CONNECTED
 ```
 
 ---
@@ -71,8 +70,7 @@ Sempre filtrar `event.source === window` ao receber.
 | type | Campos | Quando usar |
 |------|--------|-------------|
 | `PING` | — | Detectar se a extensão está instalada |
-| `REGISTER_INSTANCE` | `frontendOrigin?`, `apiOrigin?`, `apiUrl?` | **No clique** do botão, antes da assertion. Registra origens e pede permissão ao Chrome |
-| `RUN_PASSKEY_ASSERTION` | `requestId`, `publicKey` (obrig.) | Roda `navigator.credentials.get` com o challenge do servidor |
+| `RUN_PASSKEY_ASSERTION` | `requestId`, `publicKey` (obrig.), `apiOrigin?` ou `apiUrl?` | Roda a passkey e autoriza as origens enviadas (painel + API) |
 
 ### Detalhes dos campos
 
@@ -82,10 +80,13 @@ Sempre filtrar `event.source === window` ao receber.
   binários em **base64url sem padding**.
 - **`requestId`** — correlaciona o resultado (`PASSKEY_ASSERTION_RESULT`). Use
   `crypto.randomUUID()`.
-- **`frontendOrigin`** — Opcional; default `window.location.origin`.
-- **`apiOrigin`** — Opcional; use quando a API está em domínio diferente do
-  frontend (ex.: `https://api.cliente.com`). Útil se o bridge/fallback externo
-  precisar da origem da API autorizada.
+- **`apiOrigin`** — Origem da API (ex.: `https://api.seudominio.com`). Enviada
+  junto com a assertion para a extensão pedir permissão Chrome nessa origem.
+- **`apiUrl`** — Alternativa a `apiOrigin`: URL completa do endpoint (a extensão
+  extrai a origem). Use um dos dois.
+
+A origem do painel (`window.location.origin`) é detectada automaticamente pela
+extensão a partir da aba que enviou a mensagem.
 
 ---
 
@@ -94,7 +95,6 @@ Sempre filtrar `event.source === window` ao receber.
 | type | Campos | Significado |
 |------|--------|-------------|
 | `CONNECTOR_READY` | — | Extensão instalada e bridge ativo na página |
-| `REGISTER_INSTANCE_RESULT` | `ok`, `error?`, `authorized?`, `needsPermission?` | Resultado do registro de instância |
 | `PASSKEY_ASSERTION_RESULT` | `requestId`, `assertion?`, `error?` | Assertion WebAuthn ou motivo de erro |
 
 ### Valores de `error` em `PASSKEY_ASSERTION_RESULT`
@@ -165,28 +165,15 @@ type ConnectorOutbound =
   | { target: typeof CONNECTOR_TARGET; type: 'PING' }
   | {
       target: typeof CONNECTOR_TARGET;
-      type: 'REGISTER_INSTANCE';
-      frontendOrigin?: string;
-      apiOrigin?: string;
-      apiUrl?: string;
-    }
-  | {
-      target: typeof CONNECTOR_TARGET;
       type: 'RUN_PASSKEY_ASSERTION';
       requestId: string;
       publicKey: unknown;
+      apiOrigin?: string;
+      apiUrl?: string;
     };
 
 type ConnectorInbound =
   | { source: typeof CONNECTOR_SOURCE; type: 'CONNECTOR_READY' }
-  | {
-      source: typeof CONNECTOR_SOURCE;
-      type: 'REGISTER_INSTANCE_RESULT';
-      ok: boolean;
-      error?: string;
-      authorized?: string[];
-      needsPermission?: boolean;
-    }
   | {
       source: typeof CONNECTOR_SOURCE;
       type: 'PASSKEY_ASSERTION_RESULT';
@@ -231,55 +218,15 @@ export function waitForConnector(timeoutMs = 2000): Promise<boolean> {
 }
 ```
 
-### Registrar instância (multi-tenant)
-
-Chamar **no handler de clique** do botão (gesto do usuário):
-
-```typescript
-export function registerInstance(opts: {
-  apiOrigin?: string;
-  apiUrl?: string;
-}): Promise<{ ok: boolean; needsPermission?: boolean; error?: string }> {
-  return new Promise((resolve) => {
-    const onMessage = (event: MessageEvent) => {
-      if (event.source !== window) return;
-      const data = event.data as ConnectorInbound;
-      if (
-        data?.source === CONNECTOR_SOURCE &&
-        data.type === 'REGISTER_INSTANCE_RESULT'
-      ) {
-        window.removeEventListener('message', onMessage);
-        resolve({
-          ok: data.ok,
-          needsPermission: data.needsPermission,
-          error: data.error,
-        });
-      }
-    };
-
-    window.addEventListener('message', onMessage);
-
-    postToConnector({
-      target: CONNECTOR_TARGET,
-      type: 'REGISTER_INSTANCE',
-      frontendOrigin: window.location.origin,
-      apiOrigin: opts.apiOrigin,
-      apiUrl: opts.apiUrl,
-    });
-
-    setTimeout(() => {
-      window.removeEventListener('message', onMessage);
-      resolve({ ok: false, error: 'Timeout ao registrar instância' });
-    }, 15000);
-  });
-}
-```
-
 ### Rodar a assertion
+
+Chamar **no handler de clique** do botão (gesto do usuário — necessário para
+pedir permissão ao Chrome na primeira vez):
 
 ```typescript
 export function runPasskeyAssertion(
   publicKey: unknown,
+  opts: { apiOrigin?: string; apiUrl?: string },
   timeoutMs = 120_000,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -312,6 +259,8 @@ export function runPasskeyAssertion(
       type: 'RUN_PASSKEY_ASSERTION',
       requestId,
       publicKey,
+      apiOrigin: opts.apiOrigin,
+      apiUrl: opts.apiUrl,
     });
   });
 }
@@ -322,30 +271,35 @@ export function runPasskeyAssertion(
 Use quando `waitForConnector()` retorna `false` mas você sabe que a extensão está instalada:
 
 ```typescript
-const EXT_ID = import.meta.env.VITE_TOGI_CONNECTOR_EXTENSION_ID;
+const EXT_ID = import.meta.env.VITE_CONNECTOR_EXTENSION_ID;
 
-export function registerInstanceExternal(opts: {
-  apiOrigin?: string;
-}): Promise<{ ok: boolean; error?: string }> {
+export function runPasskeyAssertionExternal(
+  publicKey: unknown,
+  opts: { apiOrigin?: string; apiUrl?: string },
+): Promise<{ ok: boolean; assertion?: unknown; error?: string }> {
   return new Promise((resolve) => {
     if (!EXT_ID || !chrome?.runtime?.sendMessage) {
       resolve({ ok: false, error: 'Extensão não detectada' });
       return;
     }
 
+    const requestId = crypto.randomUUID();
+
     chrome.runtime.sendMessage(
       EXT_ID,
       {
-        type: 'REGISTER_INSTANCE',
-        frontendOrigin: location.origin,
+        type: 'RUN_PASSKEY_ASSERTION',
+        requestId,
+        publicKey,
         apiOrigin: opts.apiOrigin,
+        apiUrl: opts.apiUrl,
       },
       (res) => {
         if (chrome.runtime.lastError) {
           resolve({ ok: false, error: chrome.runtime.lastError.message });
           return;
         }
-        resolve(res ?? { ok: false });
+        resolve(res ?? { ok: false, error: 'Sem resposta' });
       },
     );
   });
@@ -362,7 +316,6 @@ import { useCallback, useEffect, useState } from 'react';
 type PasskeyFlowState =
   | 'idle'
   | 'checking_extension'
-  | 'registering'
   | 'awaiting_passkey'
   | 'submitting'
   | 'success'
@@ -381,15 +334,6 @@ export function usePasskeyConnector(apiBaseUrl: string, connectionId: string) {
 
   const startPasskeyPairing = useCallback(async () => {
     setError(null);
-    setState('registering');
-
-    const reg = await registerInstance({ apiOrigin });
-    if (!reg.ok) {
-      setError(reg.error ?? 'Falha ao autorizar instância');
-      setState('error');
-      return;
-    }
-
     setState('awaiting_passkey');
 
     try {
@@ -398,7 +342,7 @@ export function usePasskeyConnector(apiBaseUrl: string, connectionId: string) {
         { credentials: 'include' },
       ).then((r) => r.json());
 
-      const assertion = await runPasskeyAssertion(publicKey);
+      const assertion = await runPasskeyAssertion(publicKey, { apiOrigin });
 
       setState('submitting');
       await fetch(`${apiBaseUrl}/api/pair/${connectionId}/passkey-response`, {
@@ -430,7 +374,7 @@ export function usePasskeyConnector(apiBaseUrl: string, connectionId: string) {
 
 ### Estado: extensão não instalada
 
-> Instale a extensão **TOGI Talk Connector** para conectar contas com passkey.
+> Instale a extensão **Conector WA** para conectar sua instância.
 > [Link para download / instruções]
 
 ### Estado: pronto
@@ -453,33 +397,33 @@ export function usePasskeyConnector(apiBaseUrl: string, connectionId: string) {
 
 ---
 
-## Multi-instância (vários TOGI Talk)
+## URL da API dinâmica
 
-Cada instância do TOGI Talk roda em URL diferente. **Não configure URLs na extensão manualmente.**
-
-O frontend envia as origens em runtime:
+**Não configure URLs fixas no manifest da extensão.** O frontend envia a URL ou
+origem da API em cada conexão:
 
 ```typescript
-await registerInstance({
-  frontendOrigin: window.location.origin,       // ex.: https://cliente1.togitalk.com.br
-  apiOrigin: new URL(apiBaseUrl).origin,          // ex.: https://api-cliente1.togitalk.com.br
+await runPasskeyAssertion(publicKey, {
+  apiOrigin: new URL(apiBaseUrl).origin,  // ex.: https://api.seudominio.com
+  // ou apiUrl: `${apiBaseUrl}/api/pair/.../passkey-challenge`,
 });
 ```
 
-Na primeira vez por origem, o Chrome exibe diálogo de permissão — isso é obrigatório por segurança. Depois fica salvo no navegador.
+Na primeira vez por origem, o Chrome exibe diálogo de permissão — isso é
+obigatório por segurança. Depois fica salvo no navegador.
 
 ---
 
 ## Checklist de implementação
 
 - [ ] Detectar extensão na tela de conexão passkey (`waitForConnector`)
-- [ ] Botão "Conectar passkey" chama `registerInstance` + challenge + `RUN_PASSKEY_ASSERTION`
+- [ ] Botão "Conectar passkey" busca challenge + `RUN_PASSKEY_ASSERTION` com `apiOrigin`/`apiUrl`
 - [ ] Backend expõe challenge (`{ publicKey }`) e recebe assertion
 - [ ] Listener / promise de `PASSKEY_ASSERTION_RESULT` correlacionado por `requestId`
 - [ ] POST da assertion **verbatim** (base64url sem padding) ao backend
 - [ ] Polling do status da instância após o POST
-- [ ] Mensagem clara se `needsPermission` ou extensão ausente
-- [ ] `VITE_TOGI_CONNECTOR_EXTENSION_ID` no `.env` (fallback externo)
+- [ ] Mensagem clara se permissão negada ou extensão ausente
+- [ ] `VITE_CONNECTOR_EXTENSION_ID` no `.env` (fallback externo)
 - [ ] Testar com API em subdomínio diferente do frontend (`apiOrigin`)
 - [ ] Retry sempre pede **novo** challenge (single-use)
 
@@ -487,8 +431,8 @@ Na primeira vez por origem, o Chrome exibe diálogo de permissão — isso é ob
 
 ## O que **não** fazer
 
-- Não hardcodar URLs de instâncias no frontend — use `window.location.origin` e `apiBaseUrl` do env.
-- Não chamar `REGISTER_INSTANCE` fora de um clique do usuário (Chrome pode bloquear `permissions.request`).
+- Não hardcodar URLs no manifest da extensão — envie `apiOrigin` ou `apiUrl` do frontend.
+- Não chamar `RUN_PASSKEY_ASSERTION` fora de um clique do usuário (Chrome pode bloquear `permissions.request`).
 - Não re-encodear campos base64url da assertion (quebra a verificação no servidor).
 - Não armazenar challenge nem assertion — são one-shot.
 - Não usar o fluxo antigo (`START_PASSKEY_IMPORT` / dump de sessão) — removido.
@@ -497,6 +441,6 @@ Na primeira vez por origem, o Chrome exibe diálogo de permissão — isso é ob
 
 ## Referência
 
-Extensão: repositório `wa-passkey-connector` / **TOGI Talk Connector**  
+Extensão: repositório `wa-passkey-connector` / **Conector WA**  
 Protocolo interno: `source` / `target` = `'wa-passkey-connector'`  
 whatsmeow: [`docs/WHATSMEOW-IMPLEMENTATION.md`](./WHATSMEOW-IMPLEMENTATION.md)

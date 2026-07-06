@@ -5,11 +5,6 @@ export default {
   theme: {
     extend: {
       colors: {
-        togi: {
-          blue: 'hsl(var(--togi-blue))',
-          navy: 'hsl(var(--togi-navy))',
-          card: 'hsl(var(--togi-navy-card))',
-        },
         border: 'hsl(var(--border))',
         input: 'hsl(var(--input))',
         ring: 'hsl(var(--ring))',

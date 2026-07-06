@@ -1,6 +1,8 @@
 const SOURCE = 'wa-passkey-connector';
 const FROM_WORKER = [
-  'PASSKEY_ASSERTION_RESULT',
+  'EXISTING_SESSION',
+  'IMPORT_SENT',
+  'IMPORT_ERROR',
   'REGISTER_INSTANCE_RESULT',
 ];
 
@@ -24,11 +26,11 @@ if (!guard.__waPasskeyConnectorBridge) {
       | {
           target?: string;
           type?: string;
-          requestId?: string;
-          publicKey?: unknown;
+          url?: string;
           frontendOrigin?: string;
           apiOrigin?: string;
           apiUrl?: string;
+          forcePasskey?: boolean;
         }
       | undefined;
     if (!data || data.target !== SOURCE) return;
@@ -57,12 +59,18 @@ if (!guard.__waPasskeyConnectorBridge) {
         });
     }
 
-    if (data.type === 'RUN_PASSKEY_ASSERTION' && data.publicKey) {
+    if (data.type === 'START_PASSKEY_IMPORT' && typeof data.url === 'string') {
       void chrome.runtime.sendMessage({
-        type: 'RUN_PASSKEY_ASSERTION',
-        requestId: data.requestId,
-        publicKey: data.publicKey,
+        type: 'START_PASSKEY_IMPORT',
+        url: data.url,
+        frontendOrigin: data.frontendOrigin ?? window.location.origin,
+        apiOrigin: data.apiOrigin,
+        forcePasskey: data.forcePasskey === true,
       });
+    }
+
+    if (data.type === 'CLEAR_AND_CONTINUE' || data.type === 'CANCEL_IMPORT') {
+      void chrome.runtime.sendMessage({ type: data.type });
     }
   });
 

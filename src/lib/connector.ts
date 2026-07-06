@@ -1,4 +1,4 @@
-import { DEFAULT_APP_HOSTS } from '@/config/app-hosts';
+import { DEV_APP_HOSTS } from '@/config/app-hosts';
 import {
   getAllHostPatterns,
   normalizeOriginInput,
@@ -92,7 +92,7 @@ export async function getInstances(): Promise<{
   authorized: string[];
 }> {
   return {
-    defaults: DEFAULT_APP_HOSTS,
+    defaults: DEV_APP_HOSTS,
     authorized: await readStoredOrigins(),
   };
 }
@@ -148,7 +148,12 @@ export function bridgeInPage() {
   const announce = () =>
     window.postMessage({ source: SOURCE, type: 'CONNECTOR_READY' }, '*');
 
-  const fromWorker = ['PASSKEY_ASSERTION_RESULT', 'REGISTER_INSTANCE_RESULT'];
+  const fromWorker = [
+    'EXISTING_SESSION',
+    'IMPORT_SENT',
+    'IMPORT_ERROR',
+    'REGISTER_INSTANCE_RESULT',
+  ];
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && typeof msg.type === 'string' && fromWorker.includes(msg.type)) {
@@ -162,11 +167,11 @@ export function bridgeInPage() {
       | {
           target?: string;
           type?: string;
-          requestId?: string;
-          publicKey?: unknown;
+          url?: string;
           frontendOrigin?: string;
           apiOrigin?: string;
           apiUrl?: string;
+          forcePasskey?: boolean;
         }
       | undefined;
     if (!data || data.target !== SOURCE) return;
@@ -193,12 +198,18 @@ export function bridgeInPage() {
         });
     }
 
-    if (data.type === 'RUN_PASSKEY_ASSERTION' && data.publicKey) {
+    if (data.type === 'START_PASSKEY_IMPORT' && typeof data.url === 'string') {
       void chrome.runtime.sendMessage({
-        type: 'RUN_PASSKEY_ASSERTION',
-        requestId: data.requestId,
-        publicKey: data.publicKey,
+        type: 'START_PASSKEY_IMPORT',
+        url: data.url,
+        frontendOrigin: data.frontendOrigin ?? window.location.origin,
+        apiOrigin: data.apiOrigin,
+        forcePasskey: data.forcePasskey === true,
       });
+    }
+
+    if (data.type === 'CLEAR_AND_CONTINUE' || data.type === 'CANCEL_IMPORT') {
+      void chrome.runtime.sendMessage({ type: data.type });
     }
   });
 
