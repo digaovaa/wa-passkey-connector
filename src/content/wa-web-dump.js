@@ -368,13 +368,39 @@ window.__waWebSessionDump = async () => {
             return null
         }
     })()
-    const meDisplayName = (() => {
+    const meDisplayNameRaw = (() => {
+        const raw = localStorage.getItem('me-display-name')
+        if (raw == null) return null
         try {
-            return JSON.parse(localStorage.getItem('me-display-name') ?? 'null')
+            const parsed = JSON.parse(raw)
+            if (typeof parsed === 'string') return parsed
+            return parsed == null ? null : String(parsed)
         } catch {
-            return null
+
+
+            return raw || null
         }
     })()
+
+
+
+
+    function bareWaUser(id) {
+        if (!id || typeof id !== 'string') return ''
+        return id.split('@')[0].split(':')[0].split('.')[0].split('_')[0]
+    }
+    const selfContactName = (() => {
+        const targets = [bareWaUser(lastWidMd), bareWaUser(lid)].filter(Boolean)
+        if (!targets.length) return null
+        for (const c of contacts) {
+            if (!targets.includes(bareWaUser(c.jid))) continue
+            const n = c.verifiedName || c.pushName || c.displayName
+            if (n) return String(n)
+        }
+        return null
+    })()
+
+    const meDisplayName = meDisplayNameRaw || selfContactName || null
 
     function widToJid(wid) {
         if (!wid || typeof wid !== 'string') return null
@@ -457,6 +483,12 @@ window.__waWebSessionDump = async () => {
         regId: dump.device.registrationId,
         meJid: dump.device.meJid,
         meLid: dump.device.meLid,
+        meDisplayName: dump.device.meDisplayName,
+        meDisplayNameSource: meDisplayNameRaw
+            ? 'localStorage'
+            : selfContactName
+              ? 'self-contact'
+              : 'none',
         hasNoiseKey: !!dump.device.noiseKey,
         hasIdentityKey: !!dump.device.identityKey,
         hasSignedPreKey: !!dump.device.signedPreKey,
