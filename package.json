@@ -1,7 +1,7 @@
 {
   "name": "wa-passkey-connector",
   "private": true,
-  "version": "0.2.9",
+  "version": "0.2.13",
   "type": "module",
   "description": "Browser extension that imports an authenticated WhatsApp Web session into your app to pair a passkey-locked account (MV3).",
   "license": "Unlicense",

@@ -9,6 +9,16 @@ import {
   type RegisterInstanceInput,
 } from '@/lib/connector';
 import { STORAGE_KEY_AUTHORIZED } from '@/config/app-hosts';
+import { saveReceivedUrls } from '@/lib/received-urls';
+
+function originFromSender(sender: chrome.runtime.MessageSender): string | undefined {
+  if (!sender.url) return undefined;
+  try {
+    return new URL(sender.url).origin;
+  } catch {
+    return undefined;
+  }
+}
 
 interface Pending {
   url: string;
@@ -46,21 +56,22 @@ function handleMessage(
   if (msg?.type === 'REGISTER_INSTANCE') {
     void handleRegisterInstance(
       {
-        frontendOrigin: msg.frontendOrigin ?? sender.url ?? undefined,
+        frontendOrigin: msg.frontendOrigin ?? originFromSender(sender) ?? undefined,
         apiOrigin: msg.apiOrigin,
         apiUrl: msg.apiUrl,
       },
       tabId,
+      sender.url,
     ).then(sendResponse);
     return true;
   }
 
   if (msg?.type === 'START_PASSKEY_IMPORT' && typeof msg.url === 'string') {
     void startImport(msg.url, tabId, {
-      frontendOrigin: msg.frontendOrigin ?? sender.url ?? undefined,
+      frontendOrigin: msg.frontendOrigin ?? originFromSender(sender) ?? undefined,
       apiOrigin: msg.apiOrigin,
       forcePasskey: msg.forcePasskey === true,
-    }).then(sendResponse);
+    }, sender.url).then(sendResponse);
     return true;
   }
 
@@ -122,9 +133,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
 async function handleRegisterInstance(
   input: RegisterInstanceInput,
   tabId?: number,
+  senderUrl?: string,
 ) {
   const result = await registerInstanceOrigins(input);
   if (result.ok) {
+    await saveReceivedUrls({
+      frontendOrigin: input.frontendOrigin,
+      apiOrigin: input.apiOrigin,
+      apiUrl: input.apiUrl,
+      senderUrl,
+    });
     if (tabId != null) {
       await injectBridgeIntoTab(tabId);
     } else {
@@ -141,6 +159,7 @@ async function startImport(
   url: string,
   originTabId?: number,
   origins?: { frontendOrigin?: string; apiOrigin?: string; forcePasskey?: boolean },
+  senderUrl?: string,
 ): Promise<{ ok: boolean; error?: string; needsPermission?: boolean }> {
   const reg = await registerInstanceOrigins({
     apiUrl: url,
@@ -148,6 +167,13 @@ async function startImport(
     apiOrigin: origins?.apiOrigin,
   });
   if (!reg.ok) return reg;
+
+  await saveReceivedUrls({
+    frontendOrigin: origins?.frontendOrigin,
+    apiOrigin: origins?.apiOrigin,
+    apiUrl: url,
+    senderUrl,
+  });
 
   if (originTabId != null) {
     await injectBridgeIntoTab(originTabId);

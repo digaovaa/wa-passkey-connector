@@ -10,6 +10,7 @@ export default function App() {
   const { theme, toggle } = useTheme();
   const { status, isActive } = useConnectionStatus();
   const { received } = useReceivedUrls();
+  const version = chrome.runtime.getManifest().version;
 
   const showStatus =
     isActive || status.phase === 'success' || status.phase === 'error';
@@ -25,6 +26,8 @@ export default function App() {
             <p className="text-sm font-medium text-foreground">Conector WA</p>
             <p className="text-[11px] text-muted-foreground">
               {isActive ? 'Conectando...' : 'Extensão ativa'}
+              {' · '}
+              v{version}
             </p>
           </div>
         </div>
