@@ -1,521 +1,359 @@
-import {
-  authorizeOrigin,
-  getInstances,
-  injectBridgeIntoOpenTabs,
-  injectBridgeIntoTab,
-  maybeInjectBridge,
-  registerInstanceOrigins,
-  removeAuthorizedOrigin,
-  type RegisterInstanceInput,
-} from '@/lib/connector';
-import { STORAGE_KEY_AUTHORIZED } from '@/config/app-hosts';
-import { saveReceivedUrls } from '@/lib/received-urls';
-
-function originFromSender(sender: chrome.runtime.MessageSender): string | undefined {
-  if (!sender.url) return undefined;
-  try {
-    return new URL(sender.url).origin;
-  } catch {
-    return undefined;
-  }
-}
-
-interface Pending {
-  url: string;
-  tabId?: number;
-  originTabId?: number;
-  attempts: number;
-  awaitingConsent?: boolean;
-  consented?: boolean;
-  noiseFails?: number;
-  /** Quando true, força SHORTCAKE_PASSKEY no WA Web. Default false = QR / telefone (fluxo Ticketz). */
-  forcePasskey?: boolean;
-}
-
-const MAX_POLLS = 120;
 const WA_ORIGIN = 'https://web.whatsapp.com';
 
-let pending: Pending | null = null;
-let pollTimer: ReturnType<typeof setInterval> | undefined;
-let pendingConfirmJid: string | undefined;
+// ---------------------------------------------------------------------------
+// Origins
+// ---------------------------------------------------------------------------
+// There is no hard-coded app host anymore. An app origin is "served" when the
+// extension holds host permission for it. That permission comes from one of:
+//   - static host_permissions (WhatsApp Web + any CONNECTOR_PARENT_HOSTS baked
+//     in at build time), or
+//   - a runtime grant the owner approved in the popup (arbitrary domains +
+//     localhost, via optional_host_permissions).
+// The chrome.permissions API is therefore the single source of truth for which
+// origins we bridge — no separate storage registry to keep in sync.
 
-function handleMessage(
-  msg: RegisterInstanceInput & {
-    type?: string;
-    url?: string;
-    origin?: string;
-    frontendOrigin?: string;
-    apiOrigin?: string;
-    forcePasskey?: boolean;
-  },
-  sender: chrome.runtime.MessageSender,
-  sendResponse: (response?: unknown) => void,
-): boolean {
-  const tabId = sender.tab?.id;
-
-  if (msg?.type === 'REGISTER_INSTANCE') {
-    void handleRegisterInstance(
-      {
-        frontendOrigin: msg.frontendOrigin ?? originFromSender(sender) ?? undefined,
-        apiOrigin: msg.apiOrigin,
-        apiUrl: msg.apiUrl,
-      },
-      tabId,
-      sender.url,
-    ).then(sendResponse);
-    return true;
+/** Turn any page URL into a host match pattern, or null if not http(s). */
+function toOriginPattern(rawUrl: string | undefined): string | null {
+  if (!rawUrl) return null;
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    // Match patterns don't carry a port; they match any port on the host.
+    return `${url.protocol}//${url.hostname}/*`;
+  } catch {
+    return null;
   }
+}
 
-  if (msg?.type === 'START_PASSKEY_IMPORT' && typeof msg.url === 'string') {
-    void startImport(msg.url, tabId, {
-      frontendOrigin: msg.frontendOrigin ?? originFromSender(sender) ?? undefined,
-      apiOrigin: msg.apiOrigin,
-      forcePasskey: msg.forcePasskey === true,
-    }, sender.url).then(sendResponse);
-    return true;
-  }
+/** A tab URL is served when we hold host permission for it (and it is not WA). */
+async function servedPattern(rawUrl: string | undefined): Promise<string | null> {
+  const pattern = toOriginPattern(rawUrl);
+  if (!pattern) return null;
+  if (rawUrl?.startsWith(`${WA_ORIGIN}/`)) return null; // never bridge WhatsApp Web
+  const has = await chrome.permissions.contains({ origins: [pattern] }).catch(
+    () => false,
+  );
+  return has ? pattern : null;
+}
 
-  if (msg?.type === 'CLEAR_AND_CONTINUE') {
-    void clearAndContinue().then(sendResponse);
-    return true;
-  }
-
-  if (msg?.type === 'CANCEL_IMPORT') {
-    cancelImport();
-    sendResponse({ ok: true });
-    return false;
-  }
-
-  if (msg?.type === 'IS_CONNECTOR_INSTALLED' || msg?.type === 'PING') {
-    sendResponse({ installed: true, ok: true });
-    return false;
-  }
-
-  if (msg?.type === 'GET_INSTANCES') {
-    void getInstances().then(sendResponse);
-    return true;
-  }
-
-  if (msg?.type === 'AUTHORIZE_INSTANCE' && typeof msg.origin === 'string') {
-    void authorizeOrigin(msg.origin).then((result) => {
-      if (result.ok) void injectBridgeIntoOpenTabs();
-      sendResponse(result);
+// ---------------------------------------------------------------------------
+// Messaging — content-script bridge path (any authorized origin)
+// ---------------------------------------------------------------------------
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === 'RUN_PASSKEY_ASSERTION' && msg.publicKey) {
+    void runAssertion(msg.publicKey).then((result) => {
+      const originTabId = sender.tab?.id;
+      if (originTabId != null) {
+        void chrome.tabs
+          .sendMessage(originTabId, {
+            type: 'PASSKEY_ASSERTION_RESULT',
+            requestId: msg.requestId,
+            ...result,
+          })
+          .catch(() => {});
+      }
+      sendResponse({ ok: Boolean(result.assertion) });
     });
     return true;
   }
-
-  if (msg?.type === 'REMOVE_INSTANCE' && typeof msg.origin === 'string') {
-    void removeAuthorizedOrigin(msg.origin).then(sendResponse);
-    return true;
+  if (msg?.type === 'IS_CONNECTOR_INSTALLED') {
+    sendResponse({ installed: true });
+    return false;
   }
-
   return false;
+});
+
+// ---------------------------------------------------------------------------
+// Messaging — parent-domain path (externally_connectable, zero content script)
+// ---------------------------------------------------------------------------
+// Active only when CONNECTOR_PARENT_HOSTS was set at build time (otherwise no
+// external page is allowed to reach us and these listeners never fire).
+// Registro dinâmico de instância: a página passa a própria origem e a extensão
+// pede host permission para ela. chrome.permissions.request exige o gesto do
+// usuário, propagado pelo sendMessage da página — por isso o registro é só via
+// onMessageExternal (sendMessage), não pela porta. Concedida a permissão, a
+// origem aparece no popup ("Authorized instances") e o bridge é injetado nas
+// abas dessa origem.
+async function authorizeOrigin(rawUrl: string | undefined): Promise<{
+  ok: boolean;
+  needsPermission?: boolean;
+  origin?: string;
+  error?: string;
+}> {
+  const pattern = toOriginPattern(rawUrl);
+  if (!pattern) return { ok: false, error: 'invalid_origin' };
+  let granted = false;
+  try {
+    // request() é idempotente (sem prompt se já concedida) e deve ser a PRIMEIRA
+    // chamada async, para preservar o gesto do usuário.
+    granted = await chrome.permissions.request({ origins: [pattern] });
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  if (!granted) return { ok: false, needsPermission: true, origin: pattern };
+  await sweepOpenTabs();
+  return { ok: true, origin: pattern };
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) =>
-  handleMessage(msg, sender, sendResponse),
-);
-
-chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) =>
-  handleMessage(msg, sender, sendResponse),
-);
-
-chrome.runtime.onInstalled.addListener(() => {
-  void injectBridgeIntoOpenTabs();
-});
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes[STORAGE_KEY_AUTHORIZED]) {
-    void injectBridgeIntoOpenTabs();
+chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === 'PING' || msg?.type === 'IS_CONNECTOR_INSTALLED') {
+    sendResponse({ installed: true, type: 'CONNECTOR_READY' });
+    return false;
   }
+  if (msg?.type === 'REGISTER_INSTANCE') {
+    void authorizeOrigin(msg.origin ?? sender.url).then(sendResponse);
+    return true; // resposta assíncrona
+  }
+  return false;
 });
 
-async function handleRegisterInstance(
-  input: RegisterInstanceInput,
-  tabId?: number,
-  senderUrl?: string,
-) {
-  const result = await registerInstanceOrigins(input);
-  if (result.ok) {
-    await saveReceivedUrls({
-      frontendOrigin: input.frontendOrigin,
-      apiOrigin: input.apiOrigin,
-      apiUrl: input.apiUrl,
-      senderUrl,
-    });
-    if (tabId != null) {
-      await injectBridgeIntoTab(tabId);
-    } else {
-      await injectBridgeIntoOpenTabs();
+chrome.runtime.onConnectExternal.addListener((port) => {
+  port.onMessage.addListener((msg) => {
+    if (msg?.type === 'PING') {
+      try {
+        port.postMessage({ type: 'CONNECTOR_READY' });
+      } catch {}
+      return;
     }
-  }
-  if (tabId != null && result.ok) {
-    notifyTab(tabId, 'REGISTER_INSTANCE_RESULT', result);
-  }
-  return result;
+    if (msg?.type === 'RUN_PASSKEY_ASSERTION' && msg.publicKey) {
+      void runAssertion(msg.publicKey).then((result) => {
+        try {
+          port.postMessage({
+            type: 'PASSKEY_ASSERTION_RESULT',
+            requestId: msg.requestId,
+            ...result,
+          });
+        } catch {}
+      });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bridge injection into authorized tabs
+// ---------------------------------------------------------------------------
+async function injectBridge(tabId: number): Promise<void> {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, func: bridgeInPage });
+  } catch {}
 }
 
-async function startImport(
-  url: string,
-  originTabId?: number,
-  origins?: { frontendOrigin?: string; apiOrigin?: string; forcePasskey?: boolean },
-  senderUrl?: string,
-): Promise<{ ok: boolean; error?: string; needsPermission?: boolean }> {
-  const reg = await registerInstanceOrigins({
-    apiUrl: url,
-    frontendOrigin: origins?.frontendOrigin,
-    apiOrigin: origins?.apiOrigin,
-  });
-  if (!reg.ok) return reg;
+async function injectIfServed(
+  tabId: number,
+  url: string | undefined,
+): Promise<void> {
+  if (await servedPattern(url)) await injectBridge(tabId);
+}
 
-  await saveReceivedUrls({
-    frontendOrigin: origins?.frontendOrigin,
-    apiOrigin: origins?.apiOrigin,
-    apiUrl: url,
-    senderUrl,
-  });
-
-  if (originTabId != null) {
-    await injectBridgeIntoTab(originTabId);
-  }
-
-  stopPoll();
-  pendingConfirmJid = undefined;
-
-  await closeExistingWaTabs();
-  await wipeWhatsAppData();
-
-  const tab = await chrome.tabs.create({ url: `${WA_ORIGIN}/`, active: true });
-  pending = {
-    url,
-    tabId: tab.id,
-    originTabId,
-    attempts: 0,
-    forcePasskey: origins?.forcePasskey === true,
-  };
-  return { ok: true };
+/** Re-attach the bridge to every already-open authorized tab. */
+async function sweepOpenTabs(): Promise<void> {
+  try {
+    const tabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
+    for (const tab of tabs) {
+      if (tab.id != null) void injectIfServed(tab.id, tab.url);
+    }
+  } catch {}
 }
 
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (info.status === 'complete' && tab.url) {
-    void maybeInjectBridge(tabId, tab.url);
-  }
-  if (!pending || pending.tabId !== tabId) return;
-  if (info.status === 'complete' && tab.url?.startsWith(`${WA_ORIGIN}/`)) {
-    void onReady(tabId);
-  }
+  if (info.status === 'complete') void injectIfServed(tabId, tab.url);
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (pending?.tabId === tabId) {
-    pending = null;
-    stopPoll();
-  }
+chrome.runtime.onInstalled.addListener(() => void sweepOpenTabs());
+chrome.runtime.onStartup.addListener(() => void sweepOpenTabs());
+
+// The popup grants a new origin (permissions.request under the user's click);
+// inject into its already-open tabs right away so no reload is needed.
+chrome.permissions.onAdded.addListener((perms) => {
+  if (perms.origins?.length) void sweepOpenTabs();
 });
 
-async function onReady(tabId: number) {
-  if (!pending) return;
-  if (!pending.consented) {
-    const existingNumber = await readExistingWid(tabId);
-    if (existingNumber) {
-      pending.awaitingConsent = true;
-      notifyOrigin('EXISTING_SESSION', { number: existingNumber });
-      return;
-    }
-  }
-  await activateTab(tabId);
-}
-
-async function readExistingWid(tabId: number): Promise<string> {
+// ---------------------------------------------------------------------------
+// Assertion core — open WhatsApp Web, run navigator.credentials.get in MAIN
+// world, return the result. Delivery (tab message vs port) is the caller's job.
+// ---------------------------------------------------------------------------
+async function runAssertion(
+  publicKey: unknown,
+): Promise<{ assertion?: unknown; error?: string }> {
+  let tabId: number | undefined;
   try {
+    const tab = await chrome.tabs.create({ url: `${WA_ORIGIN}/`, active: true });
+    tabId = tab.id;
+    if (tabId == null) return { error: 'tab_open_failed' };
+    await waitForTabComplete(tabId);
     const [inj] = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      func: () => {
-        try {
-          const raw = JSON.parse(localStorage.getItem('last-wid-md') || '""');
-          if (!raw || typeof raw !== 'string') return '';
-          return raw.split(/[.:@]/)[0] || '';
-        } catch {
-          return '';
-        }
-      },
+      func: runPasskeyAssertionInPage,
+      args: [publicKey as Parameters<typeof runPasskeyAssertionInPage>[0]],
     });
-    return (inj?.result as string) || '';
-  } catch {
-    return '';
+    const result = inj?.result as
+      | { assertion?: unknown; error?: string }
+      | undefined;
+    if (result?.assertion) return { assertion: result.assertion };
+    return { error: result?.error || 'assertion_failed' };
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : 'assertion_exception',
+    };
+  } finally {
+    if (tabId != null) void chrome.tabs.remove(tabId).catch(() => {});
   }
 }
 
-async function activateTab(tabId: number) {
-  try {
-    await chrome.tabs.update(tabId, { active: true });
-  } catch {
-    void 0;
-  }
-  if (pending?.forcePasskey) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        world: 'MAIN',
-        func: forcePasskeyModeInPage,
-      });
-    } catch {
-      void 0;
-    }
-  }
-  startPoll(tabId);
-}
-
-async function closeExistingWaTabs() {
-  try {
-    const tabs = await chrome.tabs.query({ url: `${WA_ORIGIN}/*` });
-    await Promise.all(
-      tabs.map((tab) => (tab.id != null ? chrome.tabs.remove(tab.id).catch(() => {}) : undefined)),
-    );
-  } catch {
-    void 0;
-  }
-}
-
-async function wipeWhatsAppData() {
-  try {
-    await chrome.browsingData.remove(
-      { origins: [WA_ORIGIN] },
-      {
-        cacheStorage: true,
-        cookies: true,
-        fileSystems: true,
-        indexedDB: true,
-        localStorage: true,
-        serviceWorkers: true,
-        webSQL: true,
-      },
-    );
-  } catch {
-    void 0;
-  }
-}
-
-async function clearAndContinue(): Promise<{ ok: boolean }> {
-  if (!pending || pending.tabId == null) return { ok: false };
-  pending.consented = true;
-  pending.awaitingConsent = false;
-  await wipeWhatsAppData();
-  try {
-    await chrome.tabs.reload(pending.tabId);
-  } catch {
-    void 0;
-  }
-  return { ok: true };
-}
-
-function cancelImport() {
-  const tabId = pending?.tabId;
-  pending = null;
-  stopPoll();
-  if (tabId != null) {
-    void chrome.tabs.remove(tabId).catch(() => {});
-  }
-}
-
-function notifyTab(tabId: number, type: string, extra: Record<string, unknown> = {}) {
-  void chrome.tabs.sendMessage(tabId, { type, ...extra }).catch(() => {});
-}
-
-function notifyOrigin(type: string, extra: Record<string, unknown> = {}) {
-  const originTabId = pending?.originTabId;
-  if (originTabId == null) return;
-  notifyTab(originTabId, type, extra);
-}
-
-function startPoll(tabId: number) {
-  stopPoll();
-  pollTimer = setInterval(() => void tick(tabId), 2500);
-}
-
-function stopPoll() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = undefined;
-  }
-}
-
-async function tick(tabId: number) {
-  if (!pending) {
-    stopPoll();
-    return;
-  }
-  pending.attempts += 1;
-  if (pending.attempts > MAX_POLLS) {
-    console.warn('[connector] pairing not completed in time; giving up');
-    notifyOrigin('IMPORT_ERROR', { reason: 'timeout' });
-    stopPoll();
-    pending = null;
-    return;
-  }
-
-  let wid = '';
-  try {
-    const [inj] = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: () => {
-        try {
-          return JSON.parse(localStorage.getItem('last-wid-md') || '""');
-        } catch {
-          return '';
-        }
-      },
-    });
-    wid = (inj?.result as string) || '';
-  } catch {
-    return;
-  }
-  if (!wid) return;
-
-  let dump: WebSessionDump | null | undefined;
-  try {
-    const [inj] = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: () =>
-        (
-          window as unknown as {
-            __waWebSessionDump?: () => Promise<unknown>;
-          }
-        ).__waWebSessionDump?.(),
-    });
-    dump = inj?.result as WebSessionDump | null | undefined;
-  } catch {
-    return;
-  }
-
-  const dev = dump?.device;
-  if (dev?.meJid && !dev.noiseKey) {
-    pending.noiseFails = (pending.noiseFails ?? 0) + 1;
-    if (pending.noiseFails >= 4) {
-      console.warn('[connector] noise key unobtainable on this wa-web build');
-      notifyOrigin('IMPORT_ERROR', { reason: 'noise_key_unavailable' });
-      stopPoll();
-      pending = null;
-      return;
-    }
-  }
-
-  if (!isCompleteDump(dump)) return;
-
-  const jid = dump.device.meJid as string;
-  if (pendingConfirmJid !== jid) {
-    pendingConfirmJid = jid;
-    return;
-  }
-
-  stopPoll();
-  await postDump(tabId, dump);
-}
-
-interface WebSessionDump {
-  device: {
-    noiseKey?: unknown;
-    identityKey?: unknown;
-    account?: unknown;
-    meJid?: unknown;
-  };
-}
-
-function isCompleteDump(
-  dump: WebSessionDump | null | undefined,
-): dump is WebSessionDump {
-  const d = dump?.device;
-  return !!(d && d.noiseKey && d.identityKey && d.account && d.meJid);
-}
-
-async function postDump(tabId: number, dump: WebSessionDump) {
-  const url = pending?.url;
-  if (!url) return;
-
-  const perm = await registerInstanceOrigins({ apiUrl: url });
-  if (!perm.ok) {
-    notifyOrigin('IMPORT_ERROR', {
-      reason: perm.needsPermission ? 'permission_denied' : 'network',
-      error: perm.error,
-    });
-    pending = null;
-    pendingConfirmJid = undefined;
-    return;
-  }
-
-  try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(dump),
-    });
-    if (resp.ok) {
-      console.log('[connector] paired session dumped and sent');
-      notifyOrigin('IMPORT_SENT');
-      await wipeWhatsAppData();
-      pending = null;
-      pendingConfirmJid = undefined;
-      await chrome.tabs.remove(tabId);
-    } else {
-      console.warn('[connector] dump POST failed', resp.status);
-      notifyOrigin('IMPORT_ERROR', { reason: `HTTP ${resp.status}` });
-      pending = null;
-      pendingConfirmJid = undefined;
-    }
-  } catch (e) {
-    console.warn('[connector] dump POST error', e);
-    notifyOrigin('IMPORT_ERROR', { reason: 'network' });
-    pending = null;
-    pendingConfirmJid = undefined;
-  }
-}
-
-function forcePasskeyModeInPage() {
-  type W = {
-    requireLazy?: (deps: string[], cb: (...m: unknown[]) => void) => void;
-    __waPasskeyForced?: boolean;
-  };
-  const w = window as unknown as W;
-
-  const attempt = (tries: number) => {
-    try {
-      if (typeof w.requireLazy === 'function') {
-        w.requireLazy(
-          [
-            'WAWebLinkDeviceEvents',
-            'WAWebAltDeviceLinkingApi',
-            'WAWebPairingType',
-          ],
-          (Events: unknown, AltApi: unknown, PairingType: unknown) => {
-            try {
-              const alt = AltApi as { setPairingType: (t: unknown) => void };
-              const pt = PairingType as {
-                PairingType: { SHORTCAKE_PASSKEY: unknown };
-              };
-              const ev = Events as {
-                WAWebLinkDeviceEvents: {
-                  triggerPasskeyPrologueRequest: () => void;
-                };
-              };
-              alt.setPairingType(pt.PairingType.SHORTCAKE_PASSKEY);
-              ev.WAWebLinkDeviceEvents.triggerPasskeyPrologueRequest();
-              w.__waPasskeyForced = true;
-            } catch {
-              void 0;
-            }
-          },
-        );
+function waitForTabComplete(tabId: number): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve();
+    };
+    const onUpdated = (
+      id: number,
+      info: chrome.tabs.TabChangeInfo,
+      tab: chrome.tabs.Tab,
+    ) => {
+      if (
+        id === tabId &&
+        info.status === 'complete' &&
+        tab.url?.startsWith(`${WA_ORIGIN}/`)
+      ) {
+        done();
       }
-    } catch {
-      void 0;
-    }
-    if (!w.__waPasskeyForced && tries < 40) {
-      setTimeout(() => attempt(tries + 1), 500);
-    }
-  };
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    void chrome.tabs
+      .get(tabId)
+      .then((tab) => {
+        if (tab.status === 'complete' && tab.url?.startsWith(`${WA_ORIGIN}/`)) {
+          done();
+        }
+      })
+      .catch(() => {});
+  });
+}
 
-  attempt(0);
+function runPasskeyAssertionInPage(
+  inputPublicKey: {
+    challenge: string;
+    timeout?: number;
+    rpId: string;
+    allowCredentials?: Array<{
+      id: string;
+      type: string;
+      transports?: string[];
+    }>;
+    userVerification?: string;
+    extensions?: Record<string, unknown>;
+  },
+): Promise<{ assertion?: unknown; error?: string }> {
+  function base64UrlToBuffer(value: string): ArrayBuffer {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(
+      Math.ceil(normalized.length / 4) * 4,
+      '=',
+    );
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  }
+  function bufferToBase64Url(value: ArrayBuffer): string {
+    const bytes = new Uint8Array(value);
+    let binary = '';
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte);
+    });
+    return btoa(binary)
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+  }
+  async function run(): Promise<unknown> {
+    const publicKeyOptions: PublicKeyCredentialRequestOptions = {
+      challenge: base64UrlToBuffer(inputPublicKey.challenge),
+      timeout: inputPublicKey.timeout,
+      rpId: inputPublicKey.rpId,
+      allowCredentials: (inputPublicKey.allowCredentials || []).map(
+        (credential) => ({
+          id: base64UrlToBuffer(credential.id),
+          type: 'public-key' as const,
+          transports: credential.transports as AuthenticatorTransport[],
+        }),
+      ),
+      userVerification:
+        inputPublicKey.userVerification as UserVerificationRequirement,
+      extensions: inputPublicKey.extensions as AuthenticationExtensionsClientInputs,
+    };
+
+    const credential = (await navigator.credentials.get({
+      publicKey: publicKeyOptions,
+    })) as (PublicKeyCredential & { toJSON?: () => unknown }) | null;
+    if (!credential || credential.type !== 'public-key') {
+      throw new Error('Passkey assertion was not completed');
+    }
+    if (typeof credential.toJSON === 'function') {
+      return credential.toJSON();
+    }
+    const response = credential.response as AuthenticatorAssertionResponse;
+    return {
+      id: credential.id,
+      rawId: bufferToBase64Url(credential.rawId),
+      type: credential.type,
+      response: {
+        clientDataJSON: bufferToBase64Url(response.clientDataJSON),
+        authenticatorData: bufferToBase64Url(response.authenticatorData),
+        signature: bufferToBase64Url(response.signature),
+        userHandle: response.userHandle
+          ? bufferToBase64Url(response.userHandle)
+          : null,
+      },
+    };
+  }
+  return run()
+    .then((assertion) => ({ assertion }))
+    .catch((error) => ({
+      error: error && error.message ? error.message : String(error),
+    }));
+}
+
+// Injected into authorized app pages. Bridges window.postMessage <-> worker.
+// This is the single source of the bridge (there is no static content script).
+function bridgeInPage() {
+  const SOURCE = 'wa-passkey-connector';
+  const w = window as unknown as { __waPasskeyConnectorBridge?: boolean };
+  if (w.__waPasskeyConnectorBridge) return;
+  w.__waPasskeyConnectorBridge = true;
+
+  const announce = () =>
+    window.postMessage({ source: SOURCE, type: 'CONNECTOR_READY' }, '*');
+
+  const fromWorker = ['PASSKEY_ASSERTION_RESULT'];
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg && typeof msg.type === 'string' && fromWorker.includes(msg.type)) {
+      window.postMessage({ source: SOURCE, ...msg }, '*');
+    }
+  });
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    const data = event.data as
+      | {
+          target?: string;
+          type?: string;
+          requestId?: string;
+          publicKey?: unknown;
+        }
+      | undefined;
+    if (!data || data.target !== SOURCE) return;
+    if (data.type === 'PING') announce();
+    if (data.type === 'RUN_PASSKEY_ASSERTION' && data.publicKey) {
+      void chrome.runtime.sendMessage({
+        type: 'RUN_PASSKEY_ASSERTION',
+        requestId: data.requestId,
+        publicKey: data.publicKey,
+      });
+    }
+  });
+
+  announce();
 }

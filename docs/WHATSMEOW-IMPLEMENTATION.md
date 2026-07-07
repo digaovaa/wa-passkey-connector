@@ -251,15 +251,18 @@ That is the whole worker side: fetch challenge -> submit assertion -> confirm ->
 
 ## 5. The browser extension (this repo)
 
-The extension is the only piece that touches `web.whatsapp.com`. It has two
-scripts:
+The extension is the only piece that touches `web.whatsapp.com`. All logic lives
+in one place:
 
-- **`src/content/app-bridge.ts`** (injected into **your** app pages). A small
-  detection + message relay bridge between your page and the service worker.
-- **`src/background/index.ts`** (MV3 service worker). On
-  `RUN_PASSKEY_ASSERTION { publicKey }` it opens `web.whatsapp.com`, runs
-  `navigator.credentials.get` in the page's MAIN world with your challenge, and
-  returns the assertion (`PASSKEY_ASSERTION_RESULT { assertion }`).
+- **`src/background/index.ts`** (MV3 service worker). It owns two things:
+  - **The page bridge** (`bridgeInPage`) - a small detection + message relay,
+    injected at runtime into your authorized app pages (there is no static
+    content script; see [§5.3](#53-configuring-the-extension-for-your-app-multi-instance)).
+  - **The assertion core** - on `RUN_PASSKEY_ASSERTION { publicKey }` it opens
+    `web.whatsapp.com`, runs `navigator.credentials.get` in the page's MAIN world
+    with your challenge, and returns the assertion
+    (`PASSKEY_ASSERTION_RESULT { assertion }`) over whichever transport the page
+    used (content-script bridge or parent-domain port).
 
 ### 5.1 What the service worker does
 
@@ -310,14 +313,44 @@ base64url strings; `base64UrlToBuffer` decodes them to `ArrayBuffer` for the API
 The server-provided challenge does not carry binary-input extensions
 (`prf`/`largeBlob`) in practice; pass `extensions` through as-is.
 
-### 5.3 Configuring the extension for your app
+### 5.3 Configuring the extension for your app (multi-instance)
 
-Edit **`manifest.config.ts`**: set `APP_HOSTS` to the origin(s) where your web
-app runs (add `http://localhost/*` while developing). Keep the same list in
-`APP_HOST_PATTERNS` in `src/background/index.ts` (used to inject the bridge into
-already-open tabs on install). The only permissions needed are `scripting`,
-`tabs`, `activeTab`, `storage`, plus `host_permissions` for `web.whatsapp.com`
-and your app host(s). There is no `browsingData` and no code that reads the
+One build serves **every** instance; there is no hard-coded app host. The MV3
+manifest is static, so the app origin is resolved at **runtime** via one of two
+paths - pick per instance:
+
+**A. Universal path (any domain + `localhost`).** The owner opens the app tab,
+clicks the connector icon, and hits **Authorize this instance**. Chrome grants
+host permission for that exact origin (drawn from the broad
+`optional_host_permissions`, so there is no install-time "all sites" warning),
+the worker injects the page bridge, and the grant persists across restarts. Your
+page then uses the same `window.postMessage` protocol as before ([section
+10](#10-the-postmessage-protocol)). This is the default and needs no build-time
+config.
+
+> MV3 cannot let a web page silently push its URL into an installed extension, and
+> granting a new origin **requires a user gesture**. So the one-time popup click
+> is the closest to "automatic" the platform allows for arbitrary domains. The
+> popup pre-fills the current tab's URL, so it is effectively "open popup ->
+> Authorize".
+
+**B. Parent-domain path (domains you control, zero-click).** Bake your own
+domains in at build time:
+
+```bash
+CONNECTOR_PARENT_HOSTS="https://*.yourproduct.com/*,https://*.other.com/*" npm run build
+```
+
+Each pattern is added to `host_permissions` (zero-click bridge, so path A's
+`postMessage` API works with no popup step) **and** to `externally_connectable`
+(so a page can call `chrome.runtime.connect(EXTENSION_ID)` directly, no content
+script at all). Chrome rejects wildcard-only patterns here, so list concrete
+parent domains.
+
+Permissions: `scripting`, `tabs`, `activeTab`, `storage`, plus
+`host_permissions` for `web.whatsapp.com` (always) and your parent domains (if
+any). App instances on arbitrary domains live in `optional_host_permissions`
+and are granted at runtime. There is no `browsingData` and no code that reads the
 WhatsApp Web session.
 
 ## 6. Your frontend UI
@@ -330,10 +363,16 @@ render a "resolve" panel instead of the QR. Everything is driven by
 Recommended flow:
 
 1. **Detect the extension** - `postMessage` a `PING`; if you receive
-   `CONNECTOR_READY` within ~1.5s, it is installed. Ping a few times to cover the
-   content-script attaching a beat late.
-2. **Not installed** - link to your store listing or show load-unpacked
-   instructions for `dist/`.
+   `CONNECTOR_READY` within ~1.5s, it is installed **and authorized for this
+   origin**. Ping a few times to cover the bridge attaching a beat late.
+2. **No `CONNECTOR_READY`** - two cases to tell the user apart:
+   - **Not installed** - link to your store listing or show load-unpacked
+     instructions for `dist/`.
+   - **Installed but this origin is not authorized yet** (only happens on
+     arbitrary domains, never on a `CONNECTOR_PARENT_HOSTS` domain) - tell the
+     user to click the connector's toolbar icon and hit **Authorize this
+     instance**, then retry detection. You cannot trigger that grant from the
+     page - MV3 requires the click to happen in the extension popup.
 3. **Resolve** - on the user's click:
    1. fetch the challenge from your backend (`{ publicKey }`);
    2. `postMessage` `RUN_PASSKEY_ASSERTION { requestId, publicKey }`;
@@ -490,6 +529,54 @@ await fetch(`/passkey-response/${connId}`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(assertion),
 });
 ```
+
+### 10.1 Parent-domain path (`externally_connectable`, no content script)
+
+On a domain you baked into `CONNECTOR_PARENT_HOSTS` at build time, the page can
+talk to the extension **directly** over a runtime port - no content script, no
+per-origin authorization click. The message shapes are identical to the table
+above; only the transport differs (a `chrome.runtime` port instead of
+`window.postMessage`). Your page needs the published **extension id**.
+
+```js
+// The extension id of your published/loaded build. Find it at chrome://extensions.
+const EXTENSION_ID = 'your-published-extension-id';
+
+function runAssertionDirect(publicKey, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const port = chrome.runtime.connect(EXTENSION_ID, { name: 'wa-passkey' });
+    const requestId = crypto.randomUUID();
+    const t = setTimeout(() => { port.disconnect(); reject(new Error('timeout')); }, timeoutMs);
+    port.onMessage.addListener((msg) => {
+      if (msg?.type !== 'PASSKEY_ASSERTION_RESULT' || msg.requestId !== requestId) return;
+      clearTimeout(t); port.disconnect();
+      msg.assertion ? resolve(msg.assertion) : reject(new Error(msg.error || 'failed'));
+    });
+    port.onDisconnect.addListener(() => { clearTimeout(t); reject(new Error('disconnected')); });
+    port.postMessage({ type: 'RUN_PASSKEY_ASSERTION', requestId, publicKey });
+  });
+}
+```
+
+**One code path for both.** Try the direct port first (works only on a parent
+domain where the extension exposes `chrome.runtime` to the page); fall back to
+the `postMessage` bridge (any authorized domain). Same `publicKey` in, same
+`assertion` out:
+
+```js
+async function resolveAssertion(publicKey) {
+  const canDirect =
+    typeof chrome !== 'undefined' && !!chrome.runtime?.connect && !!EXTENSION_ID;
+  if (canDirect) {
+    try { return await runAssertionDirect(publicKey); } catch { /* fall through */ }
+  }
+  return runAssertion(publicKey); // window.postMessage bridge (section 10)
+}
+```
+
+Detection mirrors this: on a parent domain, open a port and `postMessage`
+`{ type: 'PING' }` - a `CONNECTOR_READY` back means ready; a fast `onDisconnect`
+means fall back to `detectConnector`.
 
 ---
 

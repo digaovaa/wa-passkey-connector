@@ -1,13 +1,14 @@
 {
-  "name": "wa-passkey-connector",
+  "name": "central-connect",
   "private": true,
-  "version": "0.2.13",
+  "version": "0.1.12",
   "type": "module",
   "description": "Browser extension that imports an authenticated WhatsApp Web session into your app to pair a passkey-locked account (MV3).",
   "license": "Unlicense",
   "scripts": {
     "dev": "vite",
-    "build": "node scripts/bump-version.mjs && tsc --noEmit && vite build",
+    "prebuild": "npm version patch --no-git-tag-version",
+    "build": "tsc --noEmit && vite build",
     "pack": "npm run build && crx3 dist -o wa-passkey-connector.crx -p key.pem",
     "preview": "vite preview"
   },
